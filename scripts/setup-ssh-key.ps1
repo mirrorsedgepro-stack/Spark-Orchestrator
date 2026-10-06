@@ -34,7 +34,9 @@ if ($LASTEXITCODE -ne 0) { Write-Host ''; Write-Host '  ✗ Could not install th
 
 Write-Host ''
 Write-Host '  • Testing passwordless login…' -ForegroundColor Cyan
-$out = ssh -p $Port -o BatchMode=yes -o ConnectTimeout=6 $target 'echo nexus-ok'
+# Offer this key explicitly: an IdentityFile for this host in ~/.ssh/config (e.g. NVIDIA Sync) would
+# otherwise stop ssh from trying the default key at all.
+$out = ssh -p $Port -i $key -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=6 $target 'echo nexus-ok'
 if ($out -match 'nexus-ok') {
   Write-Host ''
   Write-Host '  ✓ All set. Close this tab (Ctrl+Shift+W) and click Connect on the machine in Nexus.' -ForegroundColor Green
