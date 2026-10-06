@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Nexus remote bootstrap: installs tmux, Claude Code and Gemini CLI on this Linux machine.
+# Nexus remote bootstrap: installs tmux, Claude Code and the Antigravity CLI (agy) on this Linux machine.
 # Safe to run repeatedly - anything already installed is skipped.
 set -u
 
@@ -47,39 +47,19 @@ else
   have claude && ok "claude installed" || warn "Claude install did not finish - see output above"
 fi
 
-step "Node.js 20+ (needed by Gemini CLI)"
-node_major() { node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0; }
-if have node && [ "$(node_major)" -ge 20 ]; then
-  ok "node $(node -v)"
+step "Antigravity CLI (agy)"
+if have agy; then
+  ok "agy $(agy --version 2>/dev/null | head -n1)"
 else
-  export NVM_DIR="$HOME/.nvm"
-  if [ ! -s "$NVM_DIR/nvm.sh" ]; then
-    curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
-  fi
-  # shellcheck disable=SC1091
-  . "$NVM_DIR/nvm.sh"
-  nvm install --lts && nvm alias default 'lts/*'
-  ok "node $(node -v) via nvm"
-fi
-
-step "Gemini CLI"
-if have gemini; then
-  ok "gemini $(gemini --version 2>/dev/null | head -n1)"
-else
-  prefix="$(npm config get prefix 2>/dev/null)"
-  if [ -n "$prefix" ] && [ ! -w "$prefix/lib" ] && [ ! -w "$prefix" ]; then
-    # System node with a root-owned prefix: use a per-user global dir instead of sudo npm.
-    npm config set prefix "$HOME/.npm-global"
-    export PATH="$HOME/.npm-global/bin:$PATH"
-    add_path_line 'export PATH="$HOME/.npm-global/bin:$PATH"'
-  fi
-  npm install -g @google/gemini-cli
-  have gemini && ok "gemini installed" || warn "Gemini install did not finish - see output above"
+  curl -fsSL https://antigravity.google/cli/install.sh | bash
+  export PATH="$HOME/.local/bin:$PATH"
+  add_path_line 'export PATH="$HOME/.local/bin:$PATH"'
+  have agy && ok "agy installed" || warn "Antigravity install did not finish - see output above"
 fi
 
 step "Summary"
-for t in tmux claude gemini node; do
+for t in tmux claude agy; do
   if have "$t"; then ok "$t"; else warn "$t not found"; fi
 done
-printf '\n\033[1mNext:\033[0m launch Claude and Gemini from Nexus. Each asks you to sign in the first time.\n'
+printf '\n\033[1mNext:\033[0m launch Claude and Antigravity from Nexus. Each asks you to sign in the first time.\n'
 printf 'Close this tab with Ctrl+Shift+W, then click refresh on the machine card.\n\n'

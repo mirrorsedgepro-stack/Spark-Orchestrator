@@ -2,7 +2,7 @@
   "name": "nexus-terminal",
   "productName": "Nexus",
   "version": "1.0.0",
-  "description": "One terminal to orchestrate Claude, Gemini and shells across your LAN",
+  "description": "One terminal to orchestrate Claude, Antigravity and shells across your LAN",
   "main": "main.js",
   "private": true,
   "scripts": {

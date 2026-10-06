@@ -8,6 +8,7 @@
   // ---------------------------------------------------------------- icons
   const I = {
     claude: '<svg viewBox="0 0 24 24" style="stroke-width:2.4"><path d="M12 3.5v17M3.5 12h17M6 6l12 12M18 6L6 18"/></svg>',
+    antigravity: '<svg viewBox="0 0 24 24" style="stroke-width:2.3"><path d="M4 20C6.5 12 8.8 4.5 12 4.5S17.5 12 20 20"/><path d="M8.6 14.5h6.8"/></svg>',
     gemini: '<svg viewBox="0 0 24 24"><path class="fill" d="M12 2c.7 5.3 4.7 9.3 10 10-5.3.7-9.3 4.7-10 10-.7-5.3-4.7-9.3-10-10 5.3-.7 9.3-4.7 10-10z"/></svg>',
     shell: '<svg viewBox="0 0 24 24" style="stroke-width:2.2"><path d="M5 7l5 5-5 5M12.5 18H19"/></svg>',
     gitbash: '<svg viewBox="0 0 24 24"><circle cx="6.5" cy="5.5" r="2.2"/><circle cx="6.5" cy="18.5" r="2.2"/><circle cx="17.5" cy="8" r="2.2"/><path d="M6.5 7.7v8.6M17.5 10.2c0 4.3-7 3.6-10 6.3"/></svg>',
@@ -57,7 +58,10 @@
   const glyph = (presetId, cls = '') => `<span class="glyph ${cls}" style="--c:${presetById(presetId).color}">${I[presetId] || I.shell}</span>`;
   const mIcon = (m) => (m.type === 'local' ? I.monitor : I.server);
   const presetFromTmux = (name) => { const m = /^nx-([a-z0-9]+)-/.exec(name); return m ? m[1] : 'shell'; };
-  const isAgent = (s) => s.presetId === 'claude' || s.presetId === 'gemini';
+  const isAgent = (s) => s.presetId === 'claude' || s.presetId === 'antigravity';
+  // Executable a preset launches on a machine (keys of the probe's tools map); '' = plain shell, always present.
+  const toolOf = (m, p) => (p.id === 'gitbash' ? 'gitbash' : String((p.cmd || {})[m.os] || '').split(/\s+/)[0]);
+  const isMissing = (m, p) => { const t = toolOf(m, p); return !!t && ((S.mstate[m.id] || {}).tools || {})[t] === false; };
 
   // ---------------------------------------------------------------- terminal theme
   const THEME = {
@@ -176,8 +180,7 @@
   async function launch(machineId, presetId, extra = {}) {
     const m = machineById(machineId);
     if (m.type === 'ssh' && !m.host) { openSettings(); toast(`Add the address of ${m.name} first.`); return null; }
-    const tools = (S.mstate[machineId] || {}).tools;
-    if (tools && tools[presetId] === false && !extra.raw && !extra.script) toast(installHint(m, presetId), 'warn');
+    if (isMissing(m, presetById(presetId)) && !extra.raw && !extra.script) toast(installHint(m, presetId), 'warn');
     const s = makeSession(machineId, presetId, extra);
     show(s.id);
     await frame();
@@ -223,7 +226,7 @@
     const p = presetById(presetId);
     if (m.type === 'ssh') return `${p.name} isn't installed on ${m.name}. Use "Install tools" from the machine's ⋯ menu.`;
     if (presetId === 'claude') return 'Claude Code isn\'t on PATH here. Install it: npm install -g @anthropic-ai/claude-code';
-    if (presetId === 'gemini') return 'Gemini CLI isn\'t on PATH here. Install it: npm install -g @google/gemini-cli';
+    if (presetId === 'antigravity') return 'Antigravity CLI (agy) isn\'t installed here. In PowerShell: irm https://antigravity.google/cli/install.ps1 | iex';
     return `${p.name} isn't available on ${m.name}.`;
   }
 
@@ -480,7 +483,7 @@
     const f = focused();
     const tools = st.tools || {};
     const launchers = presetsFor(m).map((p) => {
-      const missing = (p.id === 'claude' || p.id === 'gemini' || p.id === 'gitbash') && tools[p.id] === false;
+      const missing = isMissing(m, p);
       return `<button class="launch ${missing ? 'missing' : ''}" style="--c:${p.color}" data-act="launch" data-m="${m.id}" data-p="${p.id}" title="${missing ? `${esc(p.name)} is not installed on ${esc(m.name)}` : `New ${esc(p.name)} on ${esc(m.name)}`}">${glyph(p.id)}<span>${esc(p.name)}</span></button>`;
     }).join('');
     const items = sessions.map((s) => {
@@ -548,8 +551,7 @@
     const cards = [];
     for (const m of ms) {
       for (const p of presetsFor(m).filter((x) => x.id !== 'gitbash')) {
-        const tools = (S.mstate[m.id] || {}).tools || {};
-        const missing = (p.id === 'claude' || p.id === 'gemini') && tools[p.id] === false;
+        const missing = isMissing(m, p);
         cards.push(`<button class="card-launch ${missing ? 'missing' : ''}" style="--c:${p.color}" data-act="launch" data-m="${m.id}" data-p="${p.id}">
           ${glyph(p.id, 'lg')}<div><div class="cl-name">${esc(p.name)}</div><div class="cl-sub">on ${esc(m.name)}${missing ? ' · not installed' : ''}</div></div></button>`);
       }
@@ -557,7 +559,7 @@
     const unconfigured = S.cfg.machines.find((m) => m.type === 'ssh' && !m.host);
     $('#welcome').innerHTML = `
       <h1>One terminal. Every agent.</h1>
-      <div class="lead">Claude, Gemini and shells on every machine on your LAN, side by side.</div>
+      <div class="lead">Claude, Antigravity and shells on every machine on your LAN, side by side.</div>
       <div class="cards">${cards.join('')}</div>
       ${unconfigured ? `<div class="setup">${I.server}<span><b>${esc(unconfigured.name)}</b> needs an address before it can be used.</span><span class="spacer"></span><button class="btn sm" data-act="settings">Set it up</button></div>` : ''}
       <div class="keys">
@@ -622,7 +624,7 @@
       if (st.status === 'online') items.push({ label: 'Disconnect', run: () => api.disconnect(m.id) });
       else items.push({ label: 'Connect', run: () => connectMachine(m.id) });
       items.push({ label: 'Set up SSH key…', icon: I.key, run: () => setupKey(m.id) });
-      items.push({ label: 'Install tools (tmux, Claude, Gemini)…', icon: I.box, run: () => bootstrap(m.id) });
+      items.push({ label: 'Install tools (tmux, Claude, Antigravity)…', icon: I.box, run: () => bootstrap(m.id) });
     }
     items.push('sep', { label: 'Machine settings…', icon: I.gear, run: openSettings });
     showMenu(x, y, items);
@@ -664,7 +666,7 @@
       if (k === 'v') { e.preventDefault(); pasteInto(s); return false; }
     }
     if (e.shiftKey && e.key === 'Insert') { e.preventDefault(); pasteInto(s); return false; }
-    // Shift+Enter = newline without submitting in Claude Code / Gemini CLI.
+    // Shift+Enter = newline without submitting in Claude Code / Antigravity CLI.
     if (e.shiftKey && !e.ctrlKey && !e.altKey && e.key === 'Enter') {
       if (s.status === 'running') api.write(s.pid, '\x1b\r');
       e.preventDefault();
@@ -851,7 +853,7 @@
     for (const m of S.cfg.machines.filter((x) => x.type === 'ssh')) {
       cmd(`Connect ${m.name}`, () => connectMachine(m.id), '', I.plug);
       cmd(`Set up SSH key for ${m.name}`, () => setupKey(m.id), '', I.key);
-      cmd(`Install tools on ${m.name} (tmux, Claude, Gemini)`, () => bootstrap(m.id), '', I.box);
+      cmd(`Install tools on ${m.name} (tmux, Claude, Antigravity)`, () => bootstrap(m.id), '', I.box);
     }
     cmd('Reload window', () => api.reload(), 'Ctrl+Shift+R', I.refresh);
     cmd('Toggle developer tools', () => api.devtools(), 'F12', I.gear);
@@ -1006,7 +1008,7 @@
       ${ssh ? `<div class="m-form-actions">
         <button class="btn sm" data-sact="test">${I.plug} Test connection</button>
         <button class="btn sm" data-sact="key">${I.key} Set up SSH key</button>
-        <button class="btn sm" data-sact="bootstrap">${I.box} Install tmux / Claude / Gemini</button>
+        <button class="btn sm" data-sact="bootstrap">${I.box} Install tmux / Claude / Antigravity</button>
       </div><div class="probe-out"></div>` : ''}
     </div>`;
   }

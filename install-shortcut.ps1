@@ -8,7 +8,7 @@ foreach ($dir in @([Environment]::GetFolderPath('Programs'), [Environment]::GetF
   $lnk.Arguments = "`"$root`""
   $lnk.WorkingDirectory = $root
   $lnk.IconLocation = (Join-Path $root 'assets\icon.ico')
-  $lnk.Description = 'Nexus - one terminal for Claude, Gemini and shells across your LAN'
+  $lnk.Description = 'Nexus - one terminal for Claude, Antigravity and shells across your LAN'
   $lnk.Save()
   Write-Host "Created $($lnk.FullName)"
 }
