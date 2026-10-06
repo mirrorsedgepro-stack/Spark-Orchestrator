@@ -319,3 +319,37 @@ kbd { font: 500 10.5px var(--mono); padding: 1px 5px; border-radius: 5px; backgr
 .launch.missing .glyph .logo, .card-launch.missing .glyph .logo { filter: grayscale(1); }
 .m-icon .logo { width: 60%; height: 60%; object-fit: contain; pointer-events: none; }
 .setup .logo { width: 18px; height: 18px; }
+
+/* ---------- resizable split ---------- */
+.gutter { position: absolute; z-index: 4; }
+.gutter.v { width: 10px; cursor: col-resize; }
+.gutter.h { height: 10px; cursor: row-resize; }
+.gutter::after { content: ''; position: absolute; border-radius: 2px; background: transparent; transition: background .15s; }
+.gutter.v::after { left: 4px; width: 2px; top: 30%; bottom: 30%; }
+.gutter.h::after { top: 4px; height: 2px; left: 30%; right: 30%; }
+.gutter:hover::after, .dragging-v .gutter.v::after, .dragging-h .gutter.h::after { background: rgba(187,154,247,.6); }
+body.dragging-v, body.dragging-v * { cursor: col-resize !important; user-select: none; }
+body.dragging-h, body.dragging-h * { cursor: row-resize !important; user-select: none; }
+
+/* ---------- machine stats ---------- */
+.m-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; margin-top: 10px; }
+.m-stats:empty { display: none; }
+.meter { display: grid; grid-template-columns: auto 1fr; grid-template-rows: auto 4px; gap: 3px 6px; align-items: baseline; min-width: 0; }
+.meter .ml { font: 600 9.5px var(--ui); letter-spacing: .08em; color: var(--text-3); }
+.meter .mv { font: 10.5px var(--mono); color: var(--text-2); text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.meter .mb { grid-column: 1 / -1; height: 4px; border-radius: 4px; background: rgba(148,163,214,.1); overflow: hidden; }
+.meter .mb i { display: block; height: 100%; border-radius: 4px; background: var(--c); transition: width .6s ease; }
+.meter.warm .mb i { background: var(--warn); }
+.meter.hot .mb i { background: var(--bad); }
+
+/* ---------- drop target / chips with icons ---------- */
+.term-host.drop::after { content: 'Drop to attach files'; position: absolute; inset: -4px; display: grid; place-items: center; border-radius: 10px; border: 2px dashed rgba(187,154,247,.6); background: rgba(9,12,19,.7); color: var(--text); font: 600 13px var(--ui); z-index: 10; }
+.chip svg { width: 10px; height: 10px; vertical-align: -1px; margin-right: 4px; }
+
+/* ---------- prompt modal / toast actions ---------- */
+.modal.prompt { width: min(460px, calc(100vw - 40px)); margin-top: 18vh; }
+.modal.prompt .field input { width: 100%; }
+.prompt-desc { margin: 0 0 12px; color: var(--text-2); font-size: 12.5px; line-height: 1.5; word-break: break-all; }
+.toast .btn { margin-left: 8px; flex: none; }
+.toast { align-items: center; }
+.meter.gpu-err .mv { color: var(--warn); }

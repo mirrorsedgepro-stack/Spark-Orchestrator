@@ -27,6 +27,11 @@
     key: '<svg viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="4"/><path d="M10.5 12.5L20 3M16 7l3 3M14 9l2 2"/></svg>',
     box: '<svg viewBox="0 0 24 24"><path d="M21 8l-9-5-9 5 9 5 9-5zM3 8v8l9 5 9-5V8M12 13v8"/></svg>',
     layout: '<svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M12 3v18M3 12h9"/></svg>',
+    folder: '<svg viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H9l2 2.5h7.5A2.5 2.5 0 0 1 21 10v7.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z"/></svg>',
+    bell: '<svg viewBox="0 0 24 24"><path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15zM10 20.5a2 2 0 0 0 4 0"/></svg>',
+    save: '<svg viewBox="0 0 24 24"><path d="M5 4h11l3 3v13H5zM8 4v5h7V4M8 20v-6h8v6"/></svg>',
+    trash: '<svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>',
+    image: '<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><circle cx="9" cy="10" r="2"/><path d="M21 16l-5-5-9 9"/></svg>',
   };
 
   // ---------------------------------------------------------------- state
@@ -46,8 +51,16 @@
     targets: new Set(),
     autoReattached: {},
     draft: null,
+    split: { x: 0.5, y: 0.5 }, // pane divider positions (fractions)
+    restoring: false,
+    palMode: null,             // custom palette source (folder picker, workspaces…)
+    dirCache: {},              // machineId -> { at, repos, dirs }
+    manualDisconnect: {},
+    machineRetry: {},
   };
   let uid = 0;
+  const baseName = (p) => String(p || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop() || p;
+  const shortPath = (p) => (p && p.length > 34 ? '…' + p.slice(-33) : p || '');
 
   const presetById = (id) => S.cfg.presets.find((p) => p.id === id) || { id, name: id, color: '#9aa3ba', cmd: {} };
   const machineById = (id) => S.cfg.machines.find((m) => m.id === id) || { id, name: id, type: 'local', color: '#646d85' };
@@ -128,11 +141,13 @@
 
     const s = {
       id, machineId, presetId, color: p.color, term, fit, search, host,
-      name: extra.name || (same ? `${p.name} ${same + 1}` : p.name),
+      name: extra.name || (extra.cwd && extra.cwd !== '~' ? `${p.name} · ${baseName(extra.cwd)}` : same ? `${p.name} ${same + 1}` : p.name),
       tmuxName: extra.attach || null,
+      cwd: extra.cwd || null,
       spec: { raw: extra.raw, cmd: extra.cmd, script: extra.script, scriptMachine: extra.scriptMachine },
       pid: null, status: 'starting', activity: 'idle', title: '',
       lastData: 0, lastInput: 0, burst: 0, quietUntil: 0, busySince: 0,
+      promptLine: null, retry: 0, retryTimer: null,
     };
     wireSession(s);
     S.sessions.set(id, s);
@@ -144,8 +159,11 @@
     const { term } = s;
     term.onData((d) => {
       s.lastInput = now();
+      // Remember where the user's last submitted prompt was, for "Send last reply".
+      if (d === '\r') { const b = term.buffer.active; s.promptLine = b.baseY + b.cursorY; }
       if (s.status === 'running') api.write(s.pid, d);
-      else if ((s.status === 'exited' || s.status === 'disconnected') && d === '\r') start(s);
+      else if (s.status === 'starting') s.pendingInput = (s.pendingInput || '') + d; // sent once connected
+      else if ((s.status === 'exited' || s.status === 'disconnected') && d === '\r') { clearTimeout(s.retryTimer); start(s); }
     });
     term.onBinary((d) => { if (s.status === 'running') api.write(s.pid, d); });
     term.onResize(({ cols, rows }) => {
@@ -154,7 +172,16 @@
       renderStatus();
     });
     term.onTitleChange((t) => { s.title = t.replace(/^[\s✳⠂⠐⠈⠁⠄⠠⡀⢀·*]+/, '').trim(); renderChrome(); });
-    term.onBell(() => { if (!isVisible(s) || !S.winFocused) markDone(s, true); });
+    // Bells (and OSC 9 / 777 notifications) are exact "agent is waiting" signals: Claude's Stop/Notification
+    // hooks ring one (see "Enable Claude alerts"), so they override the output-volume heuristic.
+    const signal = (body) => {
+      if (isVisible(s) && S.winFocused) { s.activity = 'idle'; renderChrome(); return; }
+      markDone(s, true, body);
+      renderChrome();
+    };
+    term.onBell(() => signal());
+    term.parser.registerOscHandler(9, (data) => { if (!/^\d+;/.test(data)) signal(data); return true; });
+    term.parser.registerOscHandler(777, (data) => { const [kind, , body] = data.split(';'); if (kind === 'notify') signal(body); return true; });
     term.onSelectionChange(() => {
       if (S.cfg.appearance.copyOnSelect && term.hasSelection()) api.writeClipboard(term.getSelection());
     });
@@ -165,30 +192,61 @@
       clearDone(s);
     });
     s.host.addEventListener('contextmenu', (e) => { e.preventDefault(); termMenu(e, s); });
+    // Drop files onto a pane: local paths are pasted as-is, remote ones are uploaded first.
+    s.host.addEventListener('dragover', (e) => { if (e.dataTransfer.types.includes('Files')) { e.preventDefault(); s.host.classList.add('drop'); } });
+    s.host.addEventListener('dragleave', () => s.host.classList.remove('drop'));
+    s.host.addEventListener('drop', (e) => {
+      e.preventDefault();
+      s.host.classList.remove('drop');
+      const paths = [...e.dataTransfer.files].map((f) => api.pathForFile(f)).filter(Boolean);
+      if (paths.length) attachFiles(s, paths);
+    });
+  }
+
+  // Quote a path for the session's shell / agent prompt.
+  function quotePath(s, p) {
+    if (!/[\s'"&()]/.test(p)) return p;
+    return machineById(s.machineId).type === 'local' ? `"${p}"` : `'${p.replace(/'/g, `'\\''`)}'`;
+  }
+
+  async function attachFiles(s, paths) {
+    if (s.status !== 'running') { toast('Session is not running', 'warn'); return; }
+    const remote = machineById(s.machineId).type === 'ssh';
+    if (remote) toast(`Uploading ${paths.length} file${paths.length > 1 ? 's' : ''} to ${machineById(s.machineId).name}…`, '', 1800);
+    const r = await api.uploadFiles(s.pid, paths);
+    if (!r.ok) { toast(r.error, 'bad'); return; }
+    s.term.paste(r.paths.map((p) => quotePath(s, p)).join(' ') + ' ');
+    s.term.focus();
+    if (remote) toast(`Uploaded to ~/.nexus/uploads`, 'ok', 1800);
   }
 
   async function start(s) {
     const m = machineById(s.machineId);
     s.status = 'starting';
     renderChrome();
-    if (m.type === 'ssh') s.term.write(`\x1b[2m${s.tmuxName ? 'attaching' : 'connecting'} to ${m.name}…\x1b[0m\r\n`);
+    if (m.type === 'ssh' && !s.retry) s.term.write(`\x1b[2m${s.tmuxName ? 'attaching' : 'connecting'} to ${m.name}…\x1b[0m\r\n`);
     const r = await api.create({
       machineId: s.machineId, presetId: s.presetId, cols: s.term.cols, rows: s.term.rows,
-      attach: s.tmuxName || undefined, ...s.spec,
+      attach: s.tmuxName || undefined, cwd: s.cwd || undefined, ...s.spec,
     });
     if (!S.sessions.has(s.id)) { if (r.ok) api.close(r.id); return; }
     if (!r.ok) {
+      // A remote session that dropped keeps retrying quietly; anything else waits for Enter.
+      if (s.retry) { s.status = 'disconnected'; scheduleReconnect(s); renderChrome(); return; }
       s.status = 'exited';
       s.term.write(`\r\n\x1b[38;2;247;118;142m✖ ${r.error}\x1b[0m\r\n\x1b[2mEnter to retry · Ctrl+Shift+W to close\x1b[0m\r\n`);
       renderChrome();
       return;
     }
+    if (s.retry) s.term.write('\x1b[38;2;115;218;202m✓ Reconnected\x1b[0m\r\n');
+    s.retry = 0;
     s.pid = r.id;
     if (r.tmuxName) s.tmuxName = r.tmuxName;
     s.status = 'running';
     S.byPid.set(r.id, s);
     const early = S.early.get(r.id);
     if (early) { S.early.delete(r.id); s.term.write(early); }
+    if (s.pendingInput) { const p = s.pendingInput; s.pendingInput = ''; setTimeout(() => api.write(s.pid, p), 400); }
     s.quietUntil = now() + 2500;
     renderChrome();
   }
@@ -205,10 +263,11 @@
     return s;
   }
 
-  function reattach(machineId, name, { focus = true } = {}) {
+  function reattach(machineId, name, { focus = true, cwd, label } = {}) {
     const existing = ordered().find((s) => s.machineId === machineId && s.tmuxName === name);
     if (existing) return show(existing.id);
-    const s = makeSession(machineId, presetFromTmux(name), { attach: name });
+    const d = ((S.mstate[machineId] || {}).detached || []).find((x) => x.name === name);
+    const s = makeSession(machineId, presetFromTmux(name), { attach: name, cwd: cwd || (d && d.cwd) || undefined, name: label });
     if (focus || !S.panes.some(Boolean)) show(s.id, { focus });
     else renderAll();
     frame().then(() => { try { if (isVisible(s)) s.fit.fit(); } catch {} start(s); });
@@ -221,6 +280,7 @@
     S.order = S.order.filter((x) => x !== id);
     S.mru = S.mru.filter((x) => x !== id);
     S.targets.delete(id);
+    clearTimeout(s.retryTimer);
     if (s.pid) { S.byPid.delete(s.pid); api.close(s.pid, opts); }
     else if (opts.kill && s.tmuxName) api.killTmux(s.machineId, s.tmuxName);
     s.term.dispose();
@@ -246,12 +306,68 @@
     return `${p.name} isn't available on ${m.name}.`;
   }
 
+  // ---------------------------------------------------------------- auto-reconnect
+  // Dropped remote sessions retry with backoff (2s, 4s, 8s … 30s); tmux kept them running meanwhile.
+  function scheduleReconnect(s) {
+    clearTimeout(s.retryTimer);
+    s.retry = (s.retry || 0) + 1;
+    const delay = Math.min(30, 2 ** s.retry) * 1000;
+    if (s.retry === 1) s.term.write('\r\n\x1b[38;2;224;175;104m⚡ Connection lost. The session keeps running in tmux; reconnecting automatically (Enter to retry now).\x1b[0m\r\n');
+    s.retryTimer = setTimeout(() => {
+      if (!S.sessions.has(s.id) || s.status === 'running') return;
+      start(s);
+    }, delay);
+  }
+
+  function scheduleMachineRetry(id) {
+    if (S.manualDisconnect[id] || S.machineRetry[id]) return;
+    let n = 0;
+    const tick = async () => {
+      if (S.manualDisconnect[id]) { delete S.machineRetry[id]; return; }
+      n += 1;
+      const ok = await connectMachine(id, { quiet: true });
+      if (ok) { delete S.machineRetry[id]; return; }
+      S.machineRetry[id] = setTimeout(tick, Math.min(60, 2 ** n) * 1000);
+    };
+    S.machineRetry[id] = setTimeout(tick, 2000);
+  }
+
+  // ---------------------------------------------------------------- last reply extraction
+  // Text the agent printed since the user's last submitted prompt, minus TUI chrome (boxes, hints).
+  function lastReply(s) {
+    const b = s.term.buffer.active;
+    const end = b.length;
+    const startLine = s.promptLine != null ? Math.max(0, s.promptLine - 2) : Math.max(0, end - 120);
+    const BOX = /^[\s─━│┃╭╮╰╯┌┐└┘═║╔╗╚╝▔▁·•]*$/;
+    const CHROME = /^\s*(\? for shortcuts|esc to interrupt|press .* to|⏵⏵|✻|✶|✳|·\s+\w+ing…|auto-accept|bypass permissions)/i;
+    let lines = [];
+    for (let i = startLine; i < end; i++) {
+      const l = b.getLine(i);
+      if (!l) continue;
+      let t = l.translateToString(true).replace(/^\s*[│┃]\s?/, '').replace(/\s?[│┃]\s*$/, '');
+      if (BOX.test(t) && t.trim()) continue;
+      if (CHROME.test(t)) continue;
+      lines.push(t);
+    }
+    // Drop the echoed prompt (first lines starting with ">") and the empty input box at the bottom.
+    while (lines.length && (/^\s*>\s?/.test(lines[0]) || !lines[0].trim())) lines.shift();
+    while (lines.length && (/^\s*>\s*$/.test(lines[lines.length - 1]) || !lines[lines.length - 1].trim())) lines.pop();
+    return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim().slice(-20000);
+  }
+
+  function sendLastReply(s) {
+    const text = lastReply(s);
+    if (!text) { toast('Nothing to send yet: no output since your last prompt', 'warn'); return; }
+    S.targets = new Set(ordered().filter((o) => o !== s && o.status === 'running' && isAgent(o)).map((o) => o.id));
+    openComposer(`Here is the latest output from ${s.name} on ${machineById(s.machineId).name}:\n\n${text}\n`);
+  }
+
   // ---------------------------------------------------------------- activity tracking
-  function markDone(s, notify) {
+  function markDone(s, notify, body) {
     s.activity = 'done';
     if (notify && S.cfg.appearance.notifyWhenDone) {
       const m = machineById(s.machineId);
-      api.notify({ title: `${s.name} on ${m.name} is ready`, body: s.title || 'Finished - waiting for you', sessionId: s.id });
+      api.notify({ title: `${s.name} on ${m.name} is ready`, body: body || s.title || 'Finished - waiting for you', sessionId: s.id });
       api.flash();
     }
   }
@@ -292,7 +408,8 @@
     s.activity = 'idle';
     if (info.disconnected) {
       s.status = 'disconnected';
-      s.term.write('\r\n\x1b[38;2;224;175;104m⚡ Connection lost. The session is still running in tmux on the remote. Press Enter to reattach.\x1b[0m\r\n');
+      if (s.tmuxName) scheduleReconnect(s);
+      else s.term.write('\r\n\x1b[38;2;224;175;104m⚡ Connection lost. Press Enter to reconnect.\x1b[0m\r\n');
     } else {
       s.status = 'exited';
       s.term.write(`\r\n\x1b[2m[exited${info.code != null ? ` (${info.code})` : ''}. Enter to restart, Ctrl+Shift+W to close]\x1b[0m\r\n`);
@@ -379,6 +496,7 @@
       const act = b.dataset.pact;
       if (act === 'close') closeSession(s.id);
       else if (act === 'search') openSearch(s);
+      else if (act === 'reply') sendLastReply(s);
       else if (act === 'split') S.layout === 1 ? splitWith(s) : moveToNextPane(s);
       else if (act === 'menu') { const r = b.getBoundingClientRect(); termMenu({ clientX: r.left, clientY: r.bottom + 4 }, s); }
     });
@@ -421,9 +539,70 @@
       if (s) { if (s.host.parentElement !== body) body.appendChild(s.host); }
       else body.insertAdjacentHTML('beforeend', '<div class="pane-empty">Empty pane. Pick a session in the sidebar or press Ctrl+Shift+P</div>');
     });
+    applySplit();
     markPaneFocus();
     renderPaneHeads();
     scheduleFit();
+    persistSoon();
+  }
+
+  // ---------------------------------------------------------------- resizable split
+  function applySplit() {
+    const wrap = $('#panes');
+    const { x, y } = S.split;
+    wrap.style.gridTemplateColumns = S.layout === 1 ? '' : `${x}fr ${1 - x}fr`;
+    wrap.style.gridTemplateRows = S.layout === 4 ? `${y}fr ${1 - y}fr` : '';
+    wrap.querySelectorAll('.gutter').forEach((g) => g.remove());
+    if (S.layout === 1) return;
+    const mk = (dir) => {
+      const g = document.createElement('div');
+      g.className = `gutter ${dir}`;
+      g.title = 'Drag to resize · double-click to reset';
+      g.addEventListener('mousedown', (e) => startDrag(e, dir));
+      g.addEventListener('dblclick', () => { S.split[dir === 'v' ? 'x' : 'y'] = 0.5; applySplit(); scheduleFit(); persistSoon(); });
+      wrap.appendChild(g);
+    };
+    mk('v');
+    if (S.layout === 4) mk('h');
+    requestAnimationFrame(positionGutters);
+  }
+
+  function positionGutters() {
+    const wrap = $('#panes');
+    const r = wrap.getBoundingClientRect();
+    const a = S.paneEls[0] && S.paneEls[0].getBoundingClientRect();
+    if (!a) return;
+    const v = wrap.querySelector('.gutter.v');
+    if (v) { v.style.left = `${a.right - r.left}px`; v.style.top = '10px'; v.style.bottom = '10px'; }
+    const h = wrap.querySelector('.gutter.h');
+    if (h) { h.style.top = `${a.bottom - r.top}px`; h.style.left = '10px'; h.style.right = '10px'; }
+  }
+
+  function startDrag(e, dir) {
+    e.preventDefault();
+    const wrap = $('#panes');
+    const r = wrap.getBoundingClientRect();
+    document.body.classList.add(dir === 'v' ? 'dragging-v' : 'dragging-h');
+    let raf = 0;
+    const move = (ev) => {
+      const f = dir === 'v' ? (ev.clientX - r.left - 10) / (r.width - 20) : (ev.clientY - r.top - 10) / (r.height - 20);
+      S.split[dir === 'v' ? 'x' : 'y'] = Math.min(0.85, Math.max(0.15, f));
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        wrap.style.gridTemplateColumns = `${S.split.x}fr ${1 - S.split.x}fr`;
+        if (S.layout === 4) wrap.style.gridTemplateRows = `${S.split.y}fr ${1 - S.split.y}fr`;
+        positionGutters();
+        scheduleFit();
+      });
+    };
+    const up = () => {
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+      document.body.classList.remove('dragging-v', 'dragging-h');
+      persistSoon();
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
   }
 
   function markPaneFocus() {
@@ -441,14 +620,15 @@
       const head = el.querySelector('.pane-head');
       if (!s) { head.innerHTML = '<span class="p-sub">-</span>'; return; }
       const m = machineById(s.machineId);
-      const stateChip = s.status === 'disconnected' ? '<span class="chip" style="--mc:#e0af68">disconnected</span>'
+      const stateChip = s.status === 'disconnected' ? `<span class="chip" style="--mc:#e0af68">${s.retry ? 'reconnecting…' : 'disconnected'}</span>`
         : s.status === 'exited' ? '<span class="chip ghost">exited</span>'
         : s.status === 'starting' ? '<span class="chip ghost">starting…</span>' : '';
       head.innerHTML = `${glyph(s.presetId, 'sm', s.machineId)}<span class="p-title">${esc(s.name)}</span>`
         + `<span class="chip" style="--mc:${m.color}">${esc(m.name)}</span>`
-        + (s.tmuxName ? `<span class="chip ghost" title="tmux session - survives disconnects">${esc(s.tmuxName)}</span>` : '')
+        + (s.cwd ? `<span class="chip ghost" title="${esc(s.cwd)}">${I.folder}${esc(shortPath(s.cwd))}</span>` : '')
         + stateChip
-        + `<span class="p-sub">${esc(s.title)}</span>`
+        + `<span class="p-sub" title="${esc(s.tmuxName ? `tmux session ${s.tmuxName}` : '')}">${esc(s.title)}</span>`
+        + (isAgent(s) ? `<button class="icon-btn" data-pact="reply" title="Send last reply to another agent (Ctrl+Shift+S)">${I.send}</button>` : '')
         + `<button class="icon-btn" data-pact="search" title="Find (Ctrl+Shift+F)">${I.search}</button>`
         + `<button class="icon-btn" data-pact="split" title="${S.layout === 1 ? 'Split side by side' : 'Move to next pane'}">${I.split}</button>`
         + `<button class="icon-btn" data-pact="menu" title="More">${I.more}</button>`
@@ -467,7 +647,8 @@
       }
     });
   }
-  const frame = () => new Promise((r) => requestAnimationFrame(() => r()));
+  // Next paint, but never stall: rAF doesn't fire while the window is minimized or fully covered.
+  const frame = () => new Promise((r) => { const t = setTimeout(r, 50); requestAnimationFrame(() => { clearTimeout(t); r(); }); });
 
   // ---------------------------------------------------------------- chrome: tabs, sidebar, status
   function actClass(s) {
@@ -500,7 +681,7 @@
     const tools = st.tools || {};
     const launchers = presetsFor(m).map((p) => {
       const missing = isMissing(m, p);
-      return `<button class="launch ${missing ? 'missing' : ''}" style="--c:${p.color}" data-act="launch" data-m="${m.id}" data-p="${p.id}" title="${missing ? `${esc(p.name)} is not installed on ${esc(m.name)}` : `New ${esc(p.name)} on ${esc(m.name)}`}">${glyph(p.id, '', m.id)}<span>${esc(p.name)}</span></button>`;
+      return `<button class="launch ${missing ? 'missing' : ''}" style="--c:${p.color}" data-act="launch" data-m="${m.id}" data-p="${p.id}" title="${missing ? `${esc(p.name)} is not installed on ${esc(m.name)}` : `New ${esc(p.name)} on ${esc(m.name)} · Shift+click or right-click to pick a folder`}">${glyph(p.id, '', m.id)}<span>${esc(p.name)}</span></button>`;
     }).join('');
     const items = sessions.map((s) => {
       const i = S.order.indexOf(s.id);
@@ -510,7 +691,7 @@
         + `<button class="s-x" data-act="close" data-s="${s.id}" title="${s.tmuxName ? 'Detach' : 'Close'}">${I.x}</button></div>`;
     }).join('');
     const det = detached.map((d) => `<div class="s-item detached" style="--c:${presetById(presetFromTmux(d.name)).color}" data-act="reattach" data-m="${m.id}" data-name="${esc(d.name)}" title="Reattach">`
-      + `${glyph(presetFromTmux(d.name), 'sm', m.id)}<span class="s-title">${esc(d.name)}</span>`
+      + `${glyph(presetFromTmux(d.name), 'sm', m.id)}<span class="s-title">${esc(d.name)}${d.cwd ? `<span style="color:var(--text-3)"> · ${esc(shortPath(d.cwd))}</span>` : ''}</span>`
       + `<button class="s-x" data-act="kill" data-m="${m.id}" data-name="${esc(d.name)}" title="Kill this tmux session">${I.x}</button></div>`).join('');
 
     return `<div class="machine" style="--c:${m.color}" data-machine="${m.id}">
@@ -523,6 +704,7 @@
         </div>
       </div>
       ${status === 'error' && st.error ? `<div class="m-error">${esc(st.error)}<br><button data-act="settings">Open settings</button></div>` : ''}
+      ${statsHtml(m)}
       <div class="launchers">${launchers}</div>
       ${items ? `<div class="s-list">${items}</div>` : ''}
       ${det ? `<div class="s-label">Detached · still running</div><div class="s-list">${det}</div>` : ''}
@@ -534,6 +716,194 @@
     const ms = [...S.cfg.machines].sort((a, b) => (a.type === b.type ? 0 : a.type === 'ssh' ? -1 : 1));
     $('#machines').innerHTML = ms.map(machineCard).join('');
   }
+
+  // ---------------------------------------------------------------- machine stats (GPU / RAM / load)
+  const gb = (b) => (b / 1024 ** 3).toFixed(b >= 100 * 1024 ** 3 ? 0 : 1);
+  function meter(label, pct, value, title = '') {
+    const p = Math.max(0, Math.min(100, pct || 0));
+    const hot = p >= 85 ? 'hot' : p >= 60 ? 'warm' : '';
+    return `<div class="meter ${hot}" title="${esc(title)}"><span class="ml">${label}</span><span class="mv">${value}</span><span class="mb"><i style="width:${p}%"></i></span></div>`;
+  }
+  function statsHtml(m) {
+    if (m.type !== 'ssh') return '';
+    const st = S.mstate[m.id] || {};
+    const x = st.stats;
+    if (!x || st.status !== 'online') return '<div class="m-stats" data-stats="' + m.id + '"></div>';
+    const parts = [];
+    if (x.gpu && x.gpu.error) {
+      parts.push(`<div class="meter gpu-err" title="${esc(x.gpu.error)}"><span class="ml">GPU</span><span class="mv">driver unavailable</span><span class="mb"><i style="width:0"></i></span></div>`);
+    } else if (x.gpu) {
+      parts.push(meter('GPU', x.gpu.util, x.gpu.util != null ? `${x.gpu.util}%` : '-', x.gpu.name));
+      if (x.gpu.temp != null) parts.push(meter('TEMP', (x.gpu.temp - 30) / 0.6, `${x.gpu.temp}°C${x.gpu.power != null ? ` · ${Math.round(x.gpu.power)}W` : ''}`, 'GPU temperature / power'));
+    }
+    if (x.memTotal) {
+      const used = x.memTotal - (x.memAvail || 0);
+      parts.push(meter('RAM', (used / x.memTotal) * 100, `${gb(used)}/${gb(x.memTotal)} GB`, 'System memory (unified with the GPU on DGX Spark)'));
+    }
+    if (x.load != null && x.cpus) parts.push(meter('CPU', (x.load / x.cpus) * 100, `${x.load.toFixed(1)} / ${x.cpus}`, '1-minute load average / cores'));
+    return `<div class="m-stats" data-stats="${m.id}">${parts.join('')}</div>`;
+  }
+  async function pollStats() {
+    for (const m of S.cfg.machines) {
+      if (m.type !== 'ssh' || (S.mstate[m.id] || {}).status !== 'online') continue;
+      const r = await api.stats(m.id);
+      if (!r.ok || !r.stats) continue;
+      S.mstate[m.id].stats = r.stats;
+      const el = document.querySelector(`[data-stats="${m.id}"]`);
+      if (el) el.outerHTML = statsHtml(m);
+    }
+  }
+  setInterval(pollStats, 5000);
+
+  // ---------------------------------------------------------------- session persistence + workspaces
+  const persistable = (s) => !s.spec.raw && !s.spec.script;
+  function snapshot() {
+    const list = ordered().filter(persistable);
+    return {
+      layout: S.layout,
+      split: { ...S.split },
+      focus: S.focus,
+      sessions: list.map((s) => ({ machineId: s.machineId, presetId: s.presetId, cwd: s.cwd || null, tmuxName: s.tmuxName || null, name: s.name })),
+      panes: S.panes.map((id) => list.findIndex((s) => s.id === id)),
+    };
+  }
+  let persistTimer = 0;
+  function persistSoon() {
+    if (S.restoring || !S.cfg) return;
+    clearTimeout(persistTimer);
+    persistTimer = setTimeout(() => { S.cfg.lastSession = snapshot(); api.patchConfig({ lastSession: S.cfg.lastSession }); }, 800);
+  }
+
+  // Open a snapshot/workspace. resume=true reattaches remote tmux sessions; otherwise starts fresh ones.
+  async function openLayout(snap, { resume = false } = {}) {
+    if (!snap || !snap.sessions || !snap.sessions.length) return;
+    S.restoring = true;
+    const created = [];
+    for (const it of snap.sessions) {
+      const m = S.cfg.machines.find((x) => x.id === it.machineId);
+      if (!m || (m.type === 'ssh' && !m.host)) { created.push(null); continue; }
+      const extra = { cwd: it.cwd || undefined, name: it.name };
+      if (resume && it.tmuxName && m.type === 'ssh') extra.attach = it.tmuxName;
+      created.push(makeSession(it.machineId, it.presetId, extra));
+    }
+    S.layout = [1, 2, 4].includes(snap.layout) ? snap.layout : 1;
+    if (snap.split) S.split = { ...S.split, ...snap.split };
+    S.panes = Array.from({ length: S.layout }, (_, i) => { const s = created[(snap.panes || [])[i]]; return s ? s.id : null; });
+    S.focus = Math.min(snap.focus || 0, S.layout - 1);
+    renderAll();
+    await frame();
+    for (const s of created) if (s) { try { if (isVisible(s)) s.fit.fit(); } catch {} start(s); }
+    S.restoring = false;
+    const f = focused();
+    if (f) { touchMru(f.id); f.term.focus(); }
+    persistSoon();
+  }
+
+  async function saveWorkspace() {
+    const name = await promptText({ title: 'Save workspace', label: 'Name', placeholder: 'e.g. API sprint', value: '' });
+    if (!name) return;
+    const snap = snapshot();
+    if (!snap.sessions.length) { toast('Open some sessions first', 'warn'); return; }
+    const ws = (S.cfg.workspaces || []).filter((w) => w.name !== name);
+    ws.push({ name, ...snap, sessions: snap.sessions.map(({ tmuxName, ...rest }) => rest) });
+    S.cfg.workspaces = ws;
+    await api.patchConfig({ workspaces: ws });
+    toast(`Saved workspace "${name}"`, 'ok');
+  }
+  function deleteWorkspace(name) {
+    S.cfg.workspaces = (S.cfg.workspaces || []).filter((w) => w.name !== name);
+    api.patchConfig({ workspaces: S.cfg.workspaces });
+    toast(`Deleted workspace "${name}"`);
+  }
+  function openWorkspaces() {
+    const ws = S.cfg.workspaces || [];
+    openPicker({
+      placeholder: ws.length ? 'Open a workspace…' : 'No workspaces yet. Arrange your panes, then save one',
+      items: () => [
+        ...ws.map((w) => ({
+          group: 'Workspaces', icon: I.layout, label: w.name,
+          sub: w.sessions.map((s) => `${presetById(s.presetId).name}@${machineById(s.machineId).name}${s.cwd ? ` ${baseName(s.cwd)}` : ''}`).join(', '),
+          run: () => openLayout(w),
+        })),
+        { group: 'Manage', icon: I.save, label: 'Save current layout as workspace…', run: saveWorkspace },
+        ...ws.map((w) => ({ group: 'Manage', icon: I.trash, label: `Delete workspace "${w.name}"`, run: () => deleteWorkspace(w.name) })),
+      ],
+    });
+  }
+
+  // ---------------------------------------------------------------- folder picker
+  function addRecentDir(machineId, cwd) {
+    const r = { ...(S.cfg.recentDirs || {}) };
+    r[machineId] = [cwd, ...(r[machineId] || []).filter((d) => d !== cwd)].slice(0, 12);
+    S.cfg.recentDirs = r;
+    api.patchConfig({ recentDirs: r });
+  }
+  async function loadDirs(m) {
+    const c = S.dirCache[m.id];
+    if (c && now() - c.at < 60000) return c;
+    const r = m.type === 'local' ? await api.localDirs() : await api.dirs(m.id);
+    if (!r.ok) { toast(r.error, 'bad'); return { repos: [], dirs: [] }; }
+    return (S.dirCache[m.id] = { at: now(), repos: r.repos, dirs: r.dirs });
+  }
+  async function launchInFolder(machineId, presetId) {
+    const m = machineById(machineId);
+    const p = presetById(presetId);
+    if (m.type === 'ssh' && !m.host) { openSettings(); return; }
+    const recent = (S.cfg.recentDirs || {})[m.id] || [];
+    let data = { repos: [], dirs: [] };
+    const pick = (cwd) => { addRecentDir(m.id, cwd); launch(m.id, p.id, { cwd }); };
+    const items = () => {
+      const seen = new Set();
+      const out = [];
+      const add = (group, d, icon = I.folder) => { if (seen.has(d)) return; seen.add(d); out.push({ group, icon, label: d, run: () => pick(d) }); };
+      recent.forEach((d) => add('Recent', d));
+      data.repos.forEach((d) => add('Projects (git)', d));
+      add('Folders', '~');
+      data.dirs.forEach((d) => add('Folders', d));
+      return out;
+    };
+    openPicker({
+      placeholder: `Folder for ${p.name} on ${m.name}. Type a path and press Enter to use it`,
+      items,
+      onText: (text) => pick(text.trim()),
+    });
+    data = await loadDirs(m);
+    if (S.palMode && S.palMode.items === items) renderPalette();
+  }
+
+  // ---------------------------------------------------------------- prompt modal (text / passphrase)
+  function promptText({ title, label, placeholder = '', value = '', password = false, desc = '' }) {
+    return new Promise((resolve) => {
+      const ov = document.createElement('div');
+      ov.className = 'overlay';
+      ov.innerHTML = `<div class="modal prompt"><div class="modal-head"><h2>${esc(title)}</h2></div>
+        <div class="modal-body">${desc ? `<p class="prompt-desc">${esc(desc)}</p>` : ''}
+        <div class="field"><label>${esc(label)}</label><input ${password ? 'type="password"' : ''} placeholder="${esc(placeholder)}" value="${esc(value)}" spellcheck="false"></div></div>
+        <div class="modal-foot"><span class="spacer"></span><button class="btn" data-x>Cancel</button><button class="btn primary" data-ok>OK</button></div></div>`;
+      document.body.appendChild(ov);
+      const input = ov.querySelector('input');
+      const done = (v) => { ov.remove(); resolve(v); focused()?.term.focus(); };
+      ov.querySelector('[data-ok]').onclick = () => done(input.value.trim() ? input.value : null);
+      ov.querySelector('[data-x]').onclick = () => done(null);
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); done(input.value.trim() ? input.value : null); }
+        if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); done(null); }
+      });
+      setTimeout(() => input.focus(), 0);
+    });
+  }
+
+  api.onAuthAsk(async (id, info) => {
+    const v = await promptText({
+      title: `Unlock ${info.keyName}`, label: 'Passphrase', password: true,
+      desc: `${info.machine} needs the passphrase for ${info.keyFile}. It is kept in memory only until Nexus closes.`,
+    });
+    api.answerPassphrase(id, v);
+  });
+
+  api.onUpdateReady((version) => {
+    toast(`Nexus ${version} is ready to install.`, 'ok', 60000, { label: 'Restart now', run: () => api.installUpdate() });
+  });
 
   function renderStatus() {
     const ms = S.cfg.machines.map((m) => {
@@ -583,14 +953,17 @@
         <div><kbd>Ctrl</kbd> <kbd>1</kbd>…<kbd>9</kbd></div><div>Jump to session</div>
         <div><kbd>Ctrl</kbd> <kbd>Shift</kbd> <kbd>L</kbd></div><div>Cycle layout: single, split, grid</div>
         <div><kbd>Ctrl</kbd> <kbd>Shift</kbd> <kbd>Enter</kbd></div><div>Broadcast one prompt to many agents</div>
-        <div><kbd>Ctrl</kbd> <kbd>C</kbd> / <kbd>Ctrl</kbd> <kbd>V</kbd></div><div>Copy selection / paste (Ctrl+C still interrupts with no selection)</div>
+        <div><kbd>Ctrl</kbd> <kbd>Shift</kbd> <kbd>N</kbd></div><div>Launch an agent in a project folder (or Shift+click a launcher)</div>
+        <div><kbd>Ctrl</kbd> <kbd>Shift</kbd> <kbd>O</kbd></div><div>Workspaces: saved layouts of agents and folders</div>
+        <div><kbd>Ctrl</kbd> <kbd>Shift</kbd> <kbd>S</kbd></div><div>Send an agent's last reply to another agent</div>
+        <div><kbd>Ctrl</kbd> <kbd>C</kbd> / <kbd>Ctrl</kbd> <kbd>V</kbd></div><div>Copy / paste text or screenshots; drop files onto a pane to attach them</div>
       </div>`;
   }
 
   // ---------------------------------------------------------------- machines
-  async function connectMachine(id) {
-    S.mstate[id] = { ...(S.mstate[id] || {}), status: 'connecting', error: null };
-    renderChrome();
+  async function connectMachine(id, { quiet = false } = {}) {
+    delete S.manualDisconnect[id];
+    if (!quiet) { S.mstate[id] = { ...(S.mstate[id] || {}), status: 'connecting', error: null }; renderChrome(); }
     const r = await api.connect(id);
     if (!r.ok) { S.mstate[id] = { ...S.mstate[id], status: 'error', error: r.error }; renderChrome(); return false; }
     await refreshMachine(id);
@@ -607,10 +980,12 @@
     st.error = null;
     st.tools = r.tools;
     st.hostname = r.hostname;
+    st.home = r.home;
     st.detached = r.sessions.filter((x) => x.name.startsWith('nx-')).sort((a, b) => b.activity - a.activity);
     if (!S.autoReattached[id]) {
       S.autoReattached[id] = true;
-      const resumable = st.detached.filter((x) => !x.attached).slice(0, 8);
+      const open = new Set(ordered().map((s) => s.tmuxName));
+      const resumable = S.cfg.appearance.restoreSession === false ? [] : st.detached.filter((x) => !x.attached && !open.has(x.name)).slice(0, 8);
       if (resumable.length) {
         resumable.forEach((d, i) => reattach(id, d.name, { focus: i === 0 && !focused() }));
         toast(`Resumed ${resumable.length} running session${resumable.length > 1 ? 's' : ''} on ${m.name}`, 'ok');
@@ -621,26 +996,42 @@
 
   api.onMachineStatus((id, status, error) => {
     const st = (S.mstate[id] = S.mstate[id] || {});
+    const was = st.status;
     st.status = status;
     st.error = error;
     if (status === 'offline') st.detached = st.detached || [];
+    // A machine that was online and dropped (Wi-Fi, reboot) is retried in the background.
+    if (was === 'online' && (status === 'offline' || status === 'error')) scheduleMachineRetry(id);
     renderChrome();
   });
 
-  setInterval(() => {
+  setInterval(async () => {
     for (const m of S.cfg.machines) if (m.type === 'ssh' && (S.mstate[m.id] || {}).status === 'online') refreshMachine(m.id);
+    // Track where remote sessions actually are (tmux pane path), so restores and workspaces reopen there.
+    let changed = false;
+    for (const s of ordered()) {
+      if (!s.pid || !s.tmuxName) continue;
+      const cwd = await api.cwd(s.pid);
+      const home = (S.mstate[s.machineId] || {}).home;
+      const tilde = cwd && home && cwd.startsWith(home) ? '~' + cwd.slice(home.length) : cwd;
+      if (tilde && tilde !== s.cwd) { s.cwd = tilde; changed = true; }
+    }
+    if (changed) { renderPaneHeads(); persistSoon(); }
   }, 30000);
 
   function machineMenu(x, y, m) {
     const st = S.mstate[m.id] || {};
     const items = [{ header: m.name }];
     for (const p of presetsFor(m)) items.push({ label: `New ${p.name}`, glyph: p.id, m: m.id, run: () => launch(m.id, p.id) });
+    items.push('sep', { header: 'In a folder' });
+    for (const p of presetsFor(m)) items.push({ label: `${p.name} in folder…`, glyph: p.id, m: m.id, run: () => launchInFolder(m.id, p.id) });
     if (m.type === 'ssh') {
       items.push('sep');
-      if (st.status === 'online') items.push({ label: 'Disconnect', run: () => api.disconnect(m.id) });
+      if (st.status === 'online') items.push({ label: 'Disconnect', run: () => { S.manualDisconnect[m.id] = true; api.disconnect(m.id); } });
       else items.push({ label: 'Connect', run: () => connectMachine(m.id) });
       items.push({ label: 'Set up SSH key…', icon: I.key, run: () => setupKey(m.id) });
       items.push({ label: 'Install tools (tmux, Claude, Antigravity)…', icon: I.box, run: () => bootstrap(m.id) });
+      items.push({ label: 'Enable Claude alerts', icon: I.bell, run: () => enableAlerts(m.id) });
     }
     items.push('sep', { label: 'Machine settings…', icon: I.gear, run: openSettings });
     showMenu(x, y, items);
@@ -650,6 +1041,13 @@
     const m = machineById(machineId);
     if (!m.host) { openSettings(); return; }
     await launch('local', 'shell', { script: 'setup-ssh-key', scriptMachine: machineId, name: `SSH key → ${m.name}` });
+  }
+
+  async function enableAlerts(machineId) {
+    const m = machineById(machineId);
+    const r = await api.setupAlerts(machineId);
+    if (!r.ok) { toast(`Couldn't enable alerts on ${m.name}: ${r.error}`, 'bad'); return; }
+    toast(r.added ? `Claude on ${m.name} will now ring Nexus when it finishes or needs you (restart running Claude sessions)` : `Claude alerts were already enabled on ${m.name}`, 'ok', 6000);
   }
 
   async function bootstrap(machineId) {
@@ -668,9 +1066,17 @@
     toast(`Copied ${text.length} chars`, 'ok', 1200);
     return true;
   }
+  // Text pastes as usual; an image on the clipboard (e.g. Win+Shift+S) is saved as a PNG on the session's
+  // machine (uploaded for remotes) and its path is pasted, which Claude and Antigravity read as an image.
   async function pasteInto(s) {
     const text = await api.readClipboard();
-    if (text) s.term.paste(text);
+    if (text) { s.term.paste(text); return; }
+    if (s.status !== 'running') return;
+    const r = await api.pasteImage(s.pid);
+    if (!r.ok) { toast(r.error, 'bad'); return; }
+    if (!r.path) return;
+    s.term.paste(quotePath(s, r.path) + ' ');
+    toast(machineById(s.machineId).type === 'ssh' ? `Image uploaded to ${machineById(s.machineId).name}` : 'Image saved and attached', 'ok', 1800);
   }
 
   function termKey(e, s) {
@@ -701,6 +1107,9 @@
     if (c && sh && k === 'w') { closeFocused(); return true; }
     if (c && sh && k === 'f') { const s = focused(); if (s) openSearch(s); return true; }
     if (c && sh && k === 'd') { const s = focused(); if (s) splitWith(s); return true; }
+    if (c && sh && k === 's') { const s = focused(); if (s) sendLastReply(s); return true; }
+    if (c && sh && k === 'o') { openWorkspaces(); return true; }
+    if (c && sh && k === 'n') { openPalette('in folder '); return true; }
     if (c && !sh && !a && /^[1-9]$/.test(k)) { const s = ordered()[Number(k) - 1]; if (s) show(s.id); return true; }
     if (c && k === 'Tab') { cycle(sh ? -1 : 1); return true; }
     if (c && !sh && k === '`') { const id = S.mru[1]; if (id) show(id); return true; }
@@ -816,6 +1225,7 @@
       { label: 'Paste', kbd: 'Ctrl+V', run: () => pasteInto(s) },
       { label: 'Select all', run: () => s.term.selectAll() },
       { label: 'Find…', kbd: 'Ctrl+Shift+F', run: () => openSearch(s) },
+      { label: 'Send last reply to…', kbd: 'Ctrl+Shift+S', icon: I.send, run: () => sendLastReply(s) },
       { label: 'Clear scrollback', run: () => s.term.clear() },
     ];
     if (others.length) {
@@ -854,6 +1264,12 @@
       for (const p of presetsFor(m)) items.push({ group: 'Launch', glyph: p.id, m: m.id, c: p.color, label: `New ${p.name}`, sub: `on ${m.name}`, run: () => launch(m.id, p.id) });
     }
     for (const m of ms) {
+      for (const p of presetsFor(m)) items.push({ group: 'Launch in folder', glyph: p.id, m: m.id, c: p.color, label: `${p.name} in folder…`, sub: `on ${m.name}`, run: () => launchInFolder(m.id, p.id) });
+    }
+    for (const w of S.cfg.workspaces || []) {
+      items.push({ group: 'Workspaces', icon: I.layout, label: `Open workspace ${w.name}`, sub: `${w.sessions.length} sessions`, run: () => openLayout(w) });
+    }
+    for (const m of ms) {
       const open = new Set(ordered().map((s) => s.tmuxName));
       for (const d of ((S.mstate[m.id] || {}).detached || []).filter((x) => !open.has(x.name))) {
         const pid = presetFromTmux(d.name);
@@ -864,12 +1280,16 @@
     cmd('Layout: single', () => setLayout(1));
     cmd('Layout: side by side', () => setLayout(2));
     cmd('Layout: grid of four', () => setLayout(4));
-    cmd('Broadcast prompt to sessions', openComposer, 'Ctrl+Shift+Enter', I.send);
+    cmd('Broadcast prompt to sessions', () => openComposer(), 'Ctrl+Shift+Enter', I.send);
+    cmd('Workspaces…', openWorkspaces, 'Ctrl+Shift+O', I.layout);
+    cmd('Save layout as workspace…', saveWorkspace, '', I.save);
+    if (focused()) cmd(`Send last reply from ${focused().name} to…`, () => sendLastReply(focused()), 'Ctrl+Shift+S', I.send);
     cmd('Settings', openSettings, 'Ctrl+,', I.gear);
     for (const m of S.cfg.machines.filter((x) => x.type === 'ssh')) {
       cmd(`Connect ${m.name}`, () => connectMachine(m.id), '', I.plug);
       cmd(`Set up SSH key for ${m.name}`, () => setupKey(m.id), '', I.key);
       cmd(`Install tools on ${m.name} (tmux, Claude, Antigravity)`, () => bootstrap(m.id), '', I.box);
+      cmd(`Enable Claude alerts on ${m.name}`, () => enableAlerts(m.id), '', I.bell);
     }
     cmd('Reload window', () => api.reload(), 'Ctrl+Shift+R', I.refresh);
     cmd('Toggle developer tools', () => api.devtools(), 'F12', I.gear);
@@ -898,12 +1318,23 @@
     return out;
   }
 
+  // A picker reuses the palette with its own items; onText receives typed text when nothing is selected.
+  function openPicker({ placeholder, items, onText = null }) {
+    S.palMode = { placeholder, items, onText };
+    openPalette('', true);
+  }
+
   function renderPalette() {
     const q = $('#palette-input').value.trim();
-    const src = paletteSource();
+    const src = S.palMode ? S.palMode.items() : paletteSource();
+    const onText = S.palMode && S.palMode.onText;
+    if (onText && q) src.unshift({ group: 'Use', icon: I.folder, label: q, sub: 'press Enter to use this path', run: () => onText(q), exact: true });
     if (q) {
-      palItems = src.map((it) => ({ it, f: fuzzy(q, `${it.label} ${it.sub || ''}`) })).filter((x) => x.f)
+      palItems = src.map((it) => ({ it, f: it.exact ? { score: -1e6, hits: new Set() } : fuzzy(q, `${it.label} ${it.sub || ''}`) })).filter((x) => x.f)
         .sort((a, b) => b.f.score - a.f.score).map((x) => ({ ...x.it, hits: x.f.hits }));
+      // A typed path goes first only if nothing else matches well.
+      const ix = palItems.findIndex((x) => x.exact);
+      if (ix > 0 && /^[~/]|^[a-z]:[\/]/i.test(q)) palItems.unshift(...palItems.splice(ix, 1));
     } else palItems = src.map((it) => ({ ...it, hits: new Set() }));
     palSel = Math.min(palSel, Math.max(0, palItems.length - 1));
     let lastGroup = null;
@@ -918,10 +1349,12 @@
     $('#palette-list .p-item.sel')?.scrollIntoView({ block: 'nearest' });
   }
 
-  function openPalette(prefix = '') {
+  function openPalette(prefix = '', keepMode = false) {
     hideMenu();
+    if (!keepMode) S.palMode = null;
     $('#palette').hidden = false;
     const input = $('#palette-input');
+    input.placeholder = S.palMode ? S.palMode.placeholder : 'Switch session, launch Claude / Antigravity / Shell on any machine…';
     input.value = prefix;
     palSel = 0;
     renderPalette();
@@ -929,12 +1362,14 @@
   }
   function closePalette() {
     $('#palette').hidden = true;
+    S.palMode = null;
     focused()?.term.focus();
   }
   function runPalette(i) {
     const it = palItems[i];
     if (!it) return;
     $('#palette').hidden = true;
+    S.palMode = null;
     it.run();
   }
   $('#palette-input').addEventListener('input', () => { palSel = 0; renderPalette(); });
@@ -960,12 +1395,14 @@
       + (agents.length > 1 ? '<button class="tchip" data-all="agents" style="--c:#bb9af7">All agents</button>' : '')
       + (live.length ? '' : '<span class="hint">No running sessions yet</span>');
   }
-  function openComposer() {
+  function openComposer(prefill) {
     const c = $('#composer');
+    if (typeof prefill === 'string') $('#composer-text').value = prefill;
     if (!S.targets.size && focused()) S.targets.add(focused().id);
     c.hidden = false;
     renderTargets();
     $('#composer-text').focus();
+    if (typeof prefill === 'string') $('#composer-text').setSelectionRange(0, 0);
   }
   function closeComposer() {
     $('#composer').hidden = true;
@@ -1027,6 +1464,7 @@
         <button class="btn sm" data-sact="test">${I.plug} Test connection</button>
         <button class="btn sm" data-sact="key">${I.key} Set up SSH key</button>
         <button class="btn sm" data-sact="bootstrap">${I.box} Install tmux / Claude / Antigravity</button>
+        <button class="btn sm" data-sact="alerts">${I.bell} Enable Claude alerts</button>
       </div><div class="probe-out"></div>` : ''}
     </div>`;
   }
@@ -1045,6 +1483,7 @@
         <div class="field c4"><label>Font family</label><input class="mono" data-a="fontFamily" value="${esc(a.fontFamily)}"></div>
         <label class="check field c3" style="flex-direction:row"><input type="checkbox" data-a="copyOnSelect" ${a.copyOnSelect ? 'checked' : ''}><span>Copy on select</span></label>
         <label class="check field c3" style="flex-direction:row"><input type="checkbox" data-a="notifyWhenDone" ${a.notifyWhenDone ? 'checked' : ''}><span>Notify when a background agent finishes</span></label>
+        <label class="check field c6" style="flex-direction:row"><input type="checkbox" data-a="restoreSession" ${a.restoreSession !== false ? 'checked' : ''}><span>Restore sessions, layout and folders when Nexus starts</span></label>
       </div>`;
   }
 
@@ -1111,6 +1550,8 @@
     } else if (act === 'bootstrap') {
       closeSettings();
       bootstrap(m.id);
+    } else if (act === 'alerts') {
+      enableAlerts(m.id);
     }
   });
   $('#settings-save').addEventListener('click', async () => { await saveSettings(); closeSettings(); toast('Settings saved', 'ok'); });
@@ -1119,11 +1560,18 @@
   $('#btn-settings').addEventListener('click', openSettings);
 
   // ---------------------------------------------------------------- toasts
-  function toast(msg, kind = '', ms = 3800) {
+  function toast(msg, kind = '', ms = 3800, action = null) {
     const el = document.createElement('div');
     el.className = `toast ${kind}`;
     if (kind === 'warn') el.style.setProperty('--c', '#e0af68');
     el.textContent = msg;
+    if (action) {
+      const b = document.createElement('button');
+      b.className = 'btn sm primary';
+      b.textContent = action.label;
+      b.onclick = () => { el.remove(); action.run(); };
+      el.appendChild(b);
+    }
     $('#toasts').appendChild(el);
     setTimeout(() => { el.style.transition = 'opacity .3s'; el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, ms);
   }
@@ -1134,7 +1582,7 @@
     if (!b) return;
     const act = b.dataset.act;
     e.stopPropagation();
-    if (act === 'launch') launch(b.dataset.m, b.dataset.p);
+    if (act === 'launch') (e.shiftKey ? launchInFolder : launch)(b.dataset.m, b.dataset.p);
     else if (act === 'show') show(b.dataset.s);
     else if (act === 'close') closeSession(b.dataset.s);
     else if (act === 'reattach') reattach(b.dataset.m, b.dataset.name);
@@ -1147,6 +1595,8 @@
   $('#machines').addEventListener('click', onAppClick);
   $('#welcome').addEventListener('click', onAppClick);
   $('#machines').addEventListener('contextmenu', (e) => {
+    const l = e.target.closest('[data-act="launch"]');
+    if (l) { e.preventDefault(); launchInFolder(l.dataset.m, l.dataset.p); return; }
     const item = e.target.closest('[data-act="show"]');
     const card = e.target.closest('[data-machine]');
     e.preventDefault();
@@ -1164,13 +1614,14 @@
   $('#tabs').addEventListener('wheel', (e) => { $('#tabs').scrollLeft += e.deltaY; }, { passive: true });
   $('#layout-switch').addEventListener('click', (e) => { const b = e.target.closest('[data-layout]'); if (b) setLayout(Number(b.dataset.layout)); });
   $('#btn-palette').addEventListener('click', () => openPalette());
+  $('#btn-workspaces').addEventListener('click', openWorkspaces);
 
   api.onFocus((f) => {
     S.winFocused = f;
     if (f) { for (const id of S.panes) { const s = S.sessions.get(id); if (s) clearDone(s); } }
   });
   api.onNotifyClick((id) => show(id));
-  new ResizeObserver(scheduleFit).observe($('#panes'));
+  new ResizeObserver(() => { scheduleFit(); positionGutters(); }).observe($('#panes'));
 
   // ---------------------------------------------------------------- boot
   async function init() {
@@ -1184,7 +1635,10 @@
     S.mstate.local = { status: 'online' };
     api.probeLocal().then((t) => { S.mstate.local.tools = t; renderChrome(); if (!S.order.length) renderWelcome(); });
     renderAll();
-    for (const m of S.cfg.machines) if (m.type === 'ssh' && m.host) connectMachine(m.id);
+    // Bring back last time's sessions: remote ones reattach to their tmux session, local ones restart in their folder.
+    if (S.cfg.appearance.restoreSession !== false && S.cfg.lastSession) await openLayout(S.cfg.lastSession, { resume: true });
+    for (const m of S.cfg.machines) if (m.type === 'ssh' && m.host && (S.mstate[m.id] || {}).status !== 'online') connectMachine(m.id);
+    api.appInfo().then((i) => { S.version = i.version; });
   }
   init();
 })();

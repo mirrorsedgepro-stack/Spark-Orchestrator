@@ -1,6 +1,7 @@
 const { app, BrowserWindow, ipcMain, clipboard, shell, Notification, Menu } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { StringDecoder } = require('string_decoder');
 const config = require('./lib/config');
 const local = require('./lib/local');
@@ -9,8 +10,12 @@ const { Machine } = require('./lib/remote');
 if (!app.requestSingleInstanceLock()) app.quit();
 app.setAppUserModelId('com.nexus.terminal');
 
+// In the installed build, files that run outside Electron (PowerShell scripts) live next to app.asar.
+const SCRIPTS_DIR = path.join(__dirname, 'scripts').replace(`app.asar${path.sep}`, `app.asar.unpacked${path.sep}`);
+const ICON = path.join(__dirname, 'assets', 'icon.png');
+
 let win = null;
-const sessions = new Map(); // id -> { write, resize, close, kill, machineId, tmuxName }
+const sessions = new Map(); // id -> { write, resize, close, machineId, tmuxName }
 const machines = new Map(); // id -> Machine
 let nextId = 1;
 
@@ -32,6 +37,19 @@ function flush() {
   pending.clear();
 }
 
+// ---- passphrase prompts (renderer shows a modal, answers over IPC) ----
+const asks = new Map();
+let askId = 0;
+function askPassphrase(keyFile, m) {
+  return new Promise((resolve) => {
+    const id = ++askId;
+    const timer = setTimeout(() => { asks.delete(id); resolve(null); }, 120000);
+    asks.set(id, (v) => { clearTimeout(timer); asks.delete(id); resolve(v); });
+    send('auth:ask', id, { keyFile, keyName: path.basename(keyFile), machine: m.name });
+  });
+}
+ipcMain.on('auth:answer', (_e, id, value) => { const fn = asks.get(id); if (fn) fn(value || null); });
+
 // ---- machines ----
 function machineCfg(id) {
   return config.load().machines.find((m) => m.id === id);
@@ -42,12 +60,15 @@ function getMachine(id) {
       get: () => machineCfg(id),
       known: (k) => config.load().knownHosts[k],
       remember: (k, fp) => { const c = config.load(); c.knownHosts[k] = fp; config.save(c); },
+      askPassphrase,
     });
     m.on('status', (status, error) => send('machine:status', id, status, error));
     machines.set(id, m);
   }
   return machines.get(id);
 }
+
+const expandLocal = (p) => (p ? p.replace(/^~(?=[\\/]|$)/, os.homedir()) : p);
 
 // ---- window ----
 function createWindow() {
@@ -62,7 +83,7 @@ function createWindow() {
     minHeight: 520,
     backgroundColor: '#090c13',
     title: 'Nexus',
-    icon: path.join(__dirname, 'assets', 'icon.png'),
+    icon: ICON,
     titleBarStyle: 'hidden',
     titleBarOverlay: { color: '#090c13', symbolColor: '#8b93a8', height: 42 },
     show: false,
@@ -87,8 +108,22 @@ function createWindow() {
   win.webContents.on('will-navigate', (e) => e.preventDefault());
 }
 
+// ---- auto-update (installed builds only; releases on GitHub) ----
+function setupUpdates() {
+  if (!app.isPackaged) return;
+  let autoUpdater;
+  try { ({ autoUpdater } = require('electron-updater')); } catch { return; }
+  autoUpdater.autoDownload = true;
+  autoUpdater.on('update-downloaded', (info) => send('update:ready', info.version));
+  autoUpdater.on('error', () => {});
+  const check = () => autoUpdater.checkForUpdates().catch(() => {});
+  setTimeout(check, 8000);
+  setInterval(check, 6 * 60 * 60 * 1000);
+  ipcMain.on('update:install', () => autoUpdater.quitAndInstall());
+}
+
 Menu.setApplicationMenu(null);
-app.whenReady().then(createWindow);
+app.whenReady().then(() => { createWindow(); setupUpdates(); });
 app.on('second-instance', () => { if (win) { if (win.isMinimized()) win.restore(); win.focus(); } });
 app.on('window-all-closed', () => {
   for (const s of sessions.values()) { try { s.close(); } catch {} }
@@ -117,14 +152,22 @@ ipcMain.handle('config:save', (_e, cfg) => {
   }
   return config.load();
 });
+// Merge top-level keys (workspaces, lastSession, recentDirs…) without touching the rest.
+ipcMain.handle('config:patch', (_e, patch) => {
+  const c = config.load();
+  Object.assign(c, patch);
+  config.save(c);
+  return true;
+});
 ipcMain.handle('app:open-config', () => shell.openPath(config.file()));
+ipcMain.handle('app:info', () => ({ version: app.getVersion(), packaged: app.isPackaged }));
 ipcMain.on('app:devtools', () => win && win.webContents.toggleDevTools());
 ipcMain.on('app:reload', () => win && win.webContents.reloadIgnoringCache());
 ipcMain.handle('clipboard:read', () => clipboard.readText());
 ipcMain.on('clipboard:write', (_e, text) => clipboard.writeText(String(text)));
 ipcMain.on('app:notify', (_e, { title, body, sessionId }) => {
   if (!Notification.isSupported()) return;
-  const n = new Notification({ title, body, icon: path.join(__dirname, 'assets', 'icon.png') });
+  const n = new Notification({ title, body, icon: ICON });
   n.on('click', () => {
     if (!win) return;
     if (win.isMinimized()) win.restore();
@@ -137,19 +180,40 @@ ipcMain.on('app:notify', (_e, { title, body, sessionId }) => {
 ipcMain.on('app:flash', () => { if (win && !win.isFocused()) win.flashFrame(true); });
 
 // ---- IPC: machines ----
+const safe = (fn) => async (...a) => { try { return { ok: true, ...(await fn(...a)) }; } catch (err) { return { ok: false, error: err.message }; } };
 ipcMain.handle('local:probe', () => local.probe());
-ipcMain.handle('machine:connect', async (_e, id) => {
-  try { await getMachine(id).connect(); return { ok: true }; } catch (err) { return { ok: false, error: err.message }; }
-});
+ipcMain.handle('machine:connect', safe(async (_e, id) => { await getMachine(id).connect(); }));
 ipcMain.handle('machine:disconnect', (_e, id) => { getMachine(id).disconnect(); return true; });
-ipcMain.handle('machine:probe', async (_e, id) => {
-  try { return { ok: true, ...(await getMachine(id).probe()) }; } catch (err) { return { ok: false, error: err.message }; }
-});
+ipcMain.handle('machine:probe', safe((_e, id) => getMachine(id).probe()));
+ipcMain.handle('machine:stats', safe(async (_e, id) => ({ stats: await getMachine(id).stats() })));
+ipcMain.handle('machine:dirs', safe((_e, id) => getMachine(id).listDirs()));
+ipcMain.handle('machine:setup-alerts', safe(async (_e, id) => ({ added: await getMachine(id).setupAlerts() })));
 ipcMain.handle('machine:kill-tmux', async (_e, id, name) => { await getMachine(id).killTmux(name); return true; });
-ipcMain.handle('machine:upload-bootstrap', async (_e, id) => {
+ipcMain.handle('machine:upload-bootstrap', safe(async (_e, id) => {
   const content = fs.readFileSync(path.join(__dirname, 'scripts', 'linux-bootstrap.sh'), 'utf8').replace(/\r\n/g, '\n');
-  try { await getMachine(id).upload('~/.nexus/bootstrap.sh', content); return { ok: true }; } catch (err) { return { ok: false, error: err.message }; }
-});
+  await getMachine(id).upload('~/.nexus/bootstrap.sh', content);
+}));
+ipcMain.handle('local:dirs', safe(async () => {
+  // Folders under the user profile that look like projects (contain .git), plus top-level folders.
+  const home = os.homedir();
+  const repos = [], dirs = [];
+  const skip = new Set(['node_modules', 'AppData', '.git', '.cache']);
+  const walk = (dir, depth) => {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    if (entries.some((e) => e.name === '.git')) repos.push(dir);
+    if (depth >= 3 || repos.length > 300) return;
+    for (const e of entries) {
+      if (!e.isDirectory() || e.name.startsWith('.') || skip.has(e.name)) continue;
+      const p = path.join(dir, e.name);
+      if (depth < 2) dirs.push(p);
+      walk(p, depth + 1);
+    }
+  };
+  walk(home, 0);
+  const tilde = (p) => '~' + p.slice(home.length);
+  return { repos: repos.filter((p) => p !== home).map(tilde), dirs: dirs.map(tilde) };
+}));
 
 // ---- IPC: sessions ----
 ipcMain.handle('session:create', async (_e, spec) => {
@@ -167,11 +231,13 @@ ipcMain.handle('session:create', async (_e, spec) => {
       if (spec.script === 'setup-ssh-key') {
         const target = machineCfg(spec.scriptMachine);
         script = {
-          file: path.join(__dirname, 'scripts', 'setup-ssh-key.ps1'),
+          file: path.join(SCRIPTS_DIR, 'setup-ssh-key.ps1'),
           args: ['-HostName', target.host, '-User', target.user || '', '-Port', String(target.port || 22)],
         };
       }
-      const p = local.spawn({ cmd, cols, rows, script, cwd: spec.cwd });
+      let cwd = expandLocal(spec.cwd);
+      if (cwd && !fs.existsSync(cwd)) cwd = undefined;
+      const p = local.spawn({ cmd, cols, rows, script, cwd });
       sessions.set(id, {
         machineId: m.id,
         write: (d) => p.write(d),
@@ -190,7 +256,7 @@ ipcMain.handle('session:create', async (_e, spec) => {
 
     const mach = getMachine(m.id);
     const tmuxName = spec.raw ? null : (spec.attach || `nx-${preset.id}-${Date.now().toString(36).slice(-4)}${Math.random().toString(36).slice(2, 4)}`);
-    const stream = await mach.open({ tmuxName, cmd, cols, rows });
+    const stream = await mach.open({ tmuxName, cmd, cols, rows, cwd: spec.attach ? '' : spec.cwd });
     const dec = new StringDecoder('utf8');
     let exitCode = null;
     sessions.set(id, {
@@ -225,3 +291,41 @@ ipcMain.handle('session:close', async (_e, id, opts = {}) => {
   if (opts.kill && s.tmuxName) await getMachine(s.machineId).killTmux(s.tmuxName);
   return true;
 });
+ipcMain.handle('session:cwd', async (_e, id) => {
+  const s = sessions.get(id);
+  if (!s || !s.tmuxName) return null;
+  try { return await getMachine(s.machineId).paneCwd(s.tmuxName); } catch { return null; }
+});
+
+// Clipboard image -> a file the session's machine can read; returns its path for pasting.
+ipcMain.handle('session:paste-image', safe(async (_e, id) => {
+  const s = sessions.get(id);
+  if (!s) throw new Error('Session is not running');
+  const img = clipboard.readImage();
+  if (img.isEmpty()) return { path: null };
+  const png = img.toPNG();
+  const name = `paste-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
+  if (machineCfg(s.machineId).type === 'local') {
+    const dir = path.join(app.getPath('temp'), 'nexus-paste');
+    fs.mkdirSync(dir, { recursive: true });
+    const p = path.join(dir, name);
+    fs.writeFileSync(p, png);
+    return { path: p };
+  }
+  return { path: await getMachine(s.machineId).uploadToInbox(name, { buffer: png }) };
+}));
+
+// Dropped files -> paths on the session's machine (uploaded to ~/.nexus/uploads for remotes).
+ipcMain.handle('session:upload-files', safe(async (_e, id, files) => {
+  const s = sessions.get(id);
+  if (!s) throw new Error('Session is not running');
+  const out = [];
+  for (const f of files) {
+    const st = fs.statSync(f);
+    if (st.isDirectory()) throw new Error(`${path.basename(f)} is a folder; drop files instead`);
+    if (machineCfg(s.machineId).type === 'local') { out.push(f); continue; }
+    if (st.size > 512 * 1024 * 1024) throw new Error(`${path.basename(f)} is larger than 512 MB`);
+    out.push(await getMachine(s.machineId).uploadToInbox(path.basename(f), { localPath: f }));
+  }
+  return { paths: out };
+}));

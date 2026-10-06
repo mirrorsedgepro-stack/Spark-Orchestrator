@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 const on = (ch) => (fn) => {
   const h = (_e, ...a) => fn(...a);
@@ -10,18 +10,27 @@ contextBridge.exposeInMainWorld('nexus', {
   hello: () => ipcRenderer.send('app:hello'),
   getConfig: () => ipcRenderer.invoke('config:get'),
   saveConfig: (cfg) => ipcRenderer.invoke('config:save', cfg),
+  patchConfig: (patch) => ipcRenderer.invoke('config:patch', patch),
   openConfig: () => ipcRenderer.invoke('app:open-config'),
+  appInfo: () => ipcRenderer.invoke('app:info'),
   devtools: () => ipcRenderer.send('app:devtools'),
   reload: () => ipcRenderer.send('app:reload'),
   notify: (n) => ipcRenderer.send('app:notify', n),
   flash: () => ipcRenderer.send('app:flash'),
   readClipboard: () => ipcRenderer.invoke('clipboard:read'),
   writeClipboard: (t) => ipcRenderer.send('clipboard:write', t),
+  pathForFile: (file) => webUtils.getPathForFile(file),
+  installUpdate: () => ipcRenderer.send('update:install'),
+  answerPassphrase: (id, value) => ipcRenderer.send('auth:answer', id, value),
 
   probeLocal: () => ipcRenderer.invoke('local:probe'),
+  localDirs: () => ipcRenderer.invoke('local:dirs'),
   connect: (id) => ipcRenderer.invoke('machine:connect', id),
   disconnect: (id) => ipcRenderer.invoke('machine:disconnect', id),
   probe: (id) => ipcRenderer.invoke('machine:probe', id),
+  stats: (id) => ipcRenderer.invoke('machine:stats', id),
+  dirs: (id) => ipcRenderer.invoke('machine:dirs', id),
+  setupAlerts: (id) => ipcRenderer.invoke('machine:setup-alerts', id),
   killTmux: (id, name) => ipcRenderer.invoke('machine:kill-tmux', id, name),
   uploadBootstrap: (id) => ipcRenderer.invoke('machine:upload-bootstrap', id),
 
@@ -29,10 +38,15 @@ contextBridge.exposeInMainWorld('nexus', {
   write: (id, data) => ipcRenderer.send('session:write', id, data),
   resize: (id, cols, rows) => ipcRenderer.send('session:resize', id, cols, rows),
   close: (id, opts) => ipcRenderer.invoke('session:close', id, opts),
+  cwd: (id) => ipcRenderer.invoke('session:cwd', id),
+  pasteImage: (id) => ipcRenderer.invoke('session:paste-image', id),
+  uploadFiles: (id, paths) => ipcRenderer.invoke('session:upload-files', id, paths),
 
   onData: on('session:data'),
   onExit: on('session:exit'),
   onMachineStatus: on('machine:status'),
   onNotifyClick: on('notify:click'),
   onFocus: on('app:focus'),
+  onAuthAsk: on('auth:ask'),
+  onUpdateReady: on('update:ready'),
 });
