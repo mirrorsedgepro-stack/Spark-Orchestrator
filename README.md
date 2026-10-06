@@ -58,4 +58,9 @@ Edit `presets` in the config file, e.g. a project-specific command:
 
 ## Credits
 
-Antigravity logo from [selfh.st/icons](https://selfh.st/icons/) (via [dashboardicons.com](https://dashboardicons.com/icons/external/google-antigravity)), licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+Logos in `assets/icons/`, found via [dashboardicons.com](https://dashboardicons.com):
+
+- Claude, Antigravity, Git, Windows, Linux (Tux), NVIDIA: [selfh.st/icons](https://selfh.st/icons/), [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
+- PowerShell, Terminal: [homarr-labs/dashboard-icons](https://github.com/homarr-labs/dashboard-icons), [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+
+All product names and logos are trademarks of their respective owners.

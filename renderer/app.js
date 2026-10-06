@@ -55,8 +55,24 @@
   const ordered = () => S.order.map((id) => S.sessions.get(id)).filter(Boolean);
   const focused = () => S.sessions.get(S.panes[S.focus]);
   const isVisible = (s) => S.panes.includes(s.id);
-  const glyph = (presetId, cls = '') => `<span class="glyph ${cls}" style="--c:${presetById(presetId).color}">${I[presetId] || I.shell}</span>`;
-  const mIcon = (m) => (m.type === 'local' ? I.monitor : I.server);
+  // Brand logos (assets/icons; credits in README). Presets/machines may name one via an `icon` field.
+  const LOGO = {
+    claude: 'claude.svg', antigravity: 'google-antigravity.png', gitbash: 'git.svg', git: 'git.svg',
+    powershell: 'powershell.svg', terminal: 'terminal.svg', windows: 'windows.svg', linux: 'linux.svg', nvidia: 'nvidia.svg',
+  };
+  const logo = (k) => `<img class="logo" src="../assets/icons/${LOGO[k]}" alt="" draggable="false">`;
+  function presetIcon(presetId, machineId) {
+    const key = presetById(presetId).icon || presetId;
+    if (key === 'shell') return logo(machineId && machineById(machineId).os === 'windows' ? 'powershell' : 'terminal');
+    return LOGO[key] ? logo(key) : (I[key] || I.shell);
+  }
+  const glyph = (presetId, cls = '', machineId = null) => `<span class="glyph ${cls}" style="--c:${presetById(presetId).color}">${presetIcon(presetId, machineId)}</span>`;
+  function machineIconKey(m) {
+    if (m.icon && LOGO[m.icon]) return m.icon;
+    if (m.type === 'local') return 'windows';
+    return /spark|dgx/i.test(`${(S.mstate[m.id] || {}).hostname || ''} ${m.name}`) ? 'nvidia' : 'linux';
+  }
+  const mIcon = (m) => logo(machineIconKey(m));
   const presetFromTmux = (name) => { const m = /^nx-([a-z0-9]+)-/.exec(name); return m ? m[1] : 'shell'; };
   const isAgent = (s) => s.presetId === 'claude' || s.presetId === 'antigravity';
   // Executable a preset launches on a machine (keys of the probe's tools map); '' = plain shell, always present.
@@ -428,7 +444,7 @@
       const stateChip = s.status === 'disconnected' ? '<span class="chip" style="--mc:#e0af68">disconnected</span>'
         : s.status === 'exited' ? '<span class="chip ghost">exited</span>'
         : s.status === 'starting' ? '<span class="chip ghost">starting…</span>' : '';
-      head.innerHTML = `${glyph(s.presetId, 'sm')}<span class="p-title">${esc(s.name)}</span>`
+      head.innerHTML = `${glyph(s.presetId, 'sm', s.machineId)}<span class="p-title">${esc(s.name)}</span>`
         + `<span class="chip" style="--mc:${m.color}">${esc(m.name)}</span>`
         + (s.tmuxName ? `<span class="chip ghost" title="tmux session - survives disconnects">${esc(s.tmuxName)}</span>` : '')
         + stateChip
@@ -465,7 +481,7 @@
       const m = machineById(s.machineId);
       const a = actClass(s);
       return `<div class="tab ${f === s ? 'active' : ''}" style="--c:${s.color}" data-s="${s.id}" title="${esc(s.title || s.name)}">`
-        + (a ? `<span class="act ${a}"></span>` : glyph(s.presetId, 'sm'))
+        + (a ? `<span class="act ${a}"></span>` : glyph(s.presetId, 'sm', s.machineId))
         + `<span class="t-title">${esc(s.name)}</span><span class="t-mach">${esc(m.name)}</span>`
         + (i < 9 ? `<span class="t-num">^${i + 1}</span>` : '')
         + `<span class="t-close" data-close="${s.id}">${I.x}</span></div>`;
@@ -484,17 +500,17 @@
     const tools = st.tools || {};
     const launchers = presetsFor(m).map((p) => {
       const missing = isMissing(m, p);
-      return `<button class="launch ${missing ? 'missing' : ''}" style="--c:${p.color}" data-act="launch" data-m="${m.id}" data-p="${p.id}" title="${missing ? `${esc(p.name)} is not installed on ${esc(m.name)}` : `New ${esc(p.name)} on ${esc(m.name)}`}">${glyph(p.id)}<span>${esc(p.name)}</span></button>`;
+      return `<button class="launch ${missing ? 'missing' : ''}" style="--c:${p.color}" data-act="launch" data-m="${m.id}" data-p="${p.id}" title="${missing ? `${esc(p.name)} is not installed on ${esc(m.name)}` : `New ${esc(p.name)} on ${esc(m.name)}`}">${glyph(p.id, '', m.id)}<span>${esc(p.name)}</span></button>`;
     }).join('');
     const items = sessions.map((s) => {
       const i = S.order.indexOf(s.id);
-      return `<div class="s-item ${f === s ? 'active' : ''}" style="--c:${s.color}" data-act="show" data-s="${s.id}">${glyph(s.presetId, 'sm')}`
+      return `<div class="s-item ${f === s ? 'active' : ''}" style="--c:${s.color}" data-act="show" data-s="${s.id}">${glyph(s.presetId, 'sm', s.machineId)}`
         + `<span class="s-title">${esc(s.name)}${s.title ? `<span style="color:var(--text-3)"> · ${esc(s.title)}</span>` : ''}</span>`
         + `<span class="act ${actClass(s)}"></span>${i < 9 ? `<span class="s-num">^${i + 1}</span>` : ''}`
         + `<button class="s-x" data-act="close" data-s="${s.id}" title="${s.tmuxName ? 'Detach' : 'Close'}">${I.x}</button></div>`;
     }).join('');
     const det = detached.map((d) => `<div class="s-item detached" style="--c:${presetById(presetFromTmux(d.name)).color}" data-act="reattach" data-m="${m.id}" data-name="${esc(d.name)}" title="Reattach">`
-      + `${glyph(presetFromTmux(d.name), 'sm')}<span class="s-title">${esc(d.name)}</span>`
+      + `${glyph(presetFromTmux(d.name), 'sm', m.id)}<span class="s-title">${esc(d.name)}</span>`
       + `<button class="s-x" data-act="kill" data-m="${m.id}" data-name="${esc(d.name)}" title="Kill this tmux session">${I.x}</button></div>`).join('');
 
     return `<div class="machine" style="--c:${m.color}" data-machine="${m.id}">
@@ -528,7 +544,7 @@
     let info = '';
     if (s) {
       const m = machineById(s.machineId);
-      info = `<span class="st" style="color:var(--text-2)">${glyph(s.presetId, 'sm')} ${esc(s.name)} @ ${esc(m.name)}${s.tmuxName ? ` · tmux ${esc(s.tmuxName)}` : ''} · ${s.term.cols}×${s.term.rows}</span>`;
+      info = `<span class="st" style="color:var(--text-2)">${glyph(s.presetId, 'sm', s.machineId)} ${esc(s.name)} @ ${esc(m.name)}${s.tmuxName ? ` · tmux ${esc(s.tmuxName)}` : ''} · ${s.term.cols}×${s.term.rows}</span>`;
     }
     $('#status-left').innerHTML = ms + info;
     $('#layout-switch').querySelectorAll('button').forEach((b) => b.classList.toggle('active', Number(b.dataset.layout) === S.layout));
@@ -553,7 +569,7 @@
       for (const p of presetsFor(m).filter((x) => x.id !== 'gitbash')) {
         const missing = isMissing(m, p);
         cards.push(`<button class="card-launch ${missing ? 'missing' : ''}" style="--c:${p.color}" data-act="launch" data-m="${m.id}" data-p="${p.id}">
-          ${glyph(p.id, 'lg')}<div><div class="cl-name">${esc(p.name)}</div><div class="cl-sub">on ${esc(m.name)}${missing ? ' · not installed' : ''}</div></div></button>`);
+          ${glyph(p.id, 'lg', m.id)}<div><div class="cl-name">${esc(p.name)}</div><div class="cl-sub">on ${esc(m.name)}${missing ? ' · not installed' : ''}</div></div></button>`);
       }
     }
     const unconfigured = S.cfg.machines.find((m) => m.type === 'ssh' && !m.host);
@@ -618,7 +634,7 @@
   function machineMenu(x, y, m) {
     const st = S.mstate[m.id] || {};
     const items = [{ header: m.name }];
-    for (const p of presetsFor(m)) items.push({ label: `New ${p.name}`, glyph: p.id, run: () => launch(m.id, p.id) });
+    for (const p of presetsFor(m)) items.push({ label: `New ${p.name}`, glyph: p.id, m: m.id, run: () => launch(m.id, p.id) });
     if (m.type === 'ssh') {
       items.push('sep');
       if (st.status === 'online') items.push({ label: 'Disconnect', run: () => api.disconnect(m.id) });
@@ -774,7 +790,7 @@
     el.innerHTML = items.map((it, i) => {
       if (it === 'sep') return '<div class="sep"></div>';
       if (it.header) return `<div class="lbl">${esc(it.header)}</div>`;
-      const ic = it.glyph ? glyph(it.glyph, 'sm') : it.icon ? `<span style="width:18px;display:grid;place-items:center;color:var(--text-2)">${it.icon}</span>` : '<span style="width:18px"></span>';
+      const ic = it.glyph ? glyph(it.glyph, 'sm', it.m) : it.icon ? `<span style="width:18px;display:grid;place-items:center;color:var(--text-2)">${it.icon}</span>` : '<span style="width:18px"></span>';
       return `<button class="ci ${it.danger ? 'danger' : ''}" data-i="${i}" ${it.disabled ? 'disabled' : ''}>${ic}<span>${esc(it.label)}</span>${it.kbd ? `<span class="k">${esc(it.kbd)}</span>` : ''}</button>`;
     }).join('');
     el.hidden = false;
@@ -806,7 +822,7 @@
       items.push('sep', { header: sel ? 'Send selection to' : 'Send selection to (select text first)' });
       for (const o of others) {
         items.push({
-          label: `${o.name} · ${machineById(o.machineId).name}`, glyph: o.presetId, disabled: !sel,
+          label: `${o.name} · ${machineById(o.machineId).name}`, glyph: o.presetId, m: o.machineId, disabled: !sel,
           run: () => { o.term.paste(sel); toast(`Sent ${sel.length} chars to ${o.name}`, 'ok'); },
         });
       }
@@ -831,17 +847,17 @@
     const items = [];
     ordered().forEach((s, i) => {
       const m = machineById(s.machineId);
-      items.push({ group: 'Sessions', glyph: s.presetId, c: s.color, label: s.name, sub: `${m.name}${s.title ? ' · ' + s.title : ''}`, kbd: i < 9 ? `Ctrl+${i + 1}` : '', run: () => show(s.id) });
+      items.push({ group: 'Sessions', glyph: s.presetId, m: s.machineId, c: s.color, label: s.name, sub: `${m.name}${s.title ? ' · ' + s.title : ''}`, kbd: i < 9 ? `Ctrl+${i + 1}` : '', run: () => show(s.id) });
     });
     const ms = [...S.cfg.machines].sort((a, b) => (a.type === b.type ? 0 : a.type === 'ssh' ? -1 : 1));
     for (const m of ms) {
-      for (const p of presetsFor(m)) items.push({ group: 'Launch', glyph: p.id, c: p.color, label: `New ${p.name}`, sub: `on ${m.name}`, run: () => launch(m.id, p.id) });
+      for (const p of presetsFor(m)) items.push({ group: 'Launch', glyph: p.id, m: m.id, c: p.color, label: `New ${p.name}`, sub: `on ${m.name}`, run: () => launch(m.id, p.id) });
     }
     for (const m of ms) {
       const open = new Set(ordered().map((s) => s.tmuxName));
       for (const d of ((S.mstate[m.id] || {}).detached || []).filter((x) => !open.has(x.name))) {
         const pid = presetFromTmux(d.name);
-        items.push({ group: 'Detached', glyph: pid, c: presetById(pid).color, label: `Reattach ${d.name}`, sub: `on ${m.name}`, run: () => reattach(m.id, d.name) });
+        items.push({ group: 'Detached', glyph: pid, m: m.id, c: presetById(pid).color, label: `Reattach ${d.name}`, sub: `on ${m.name}`, run: () => reattach(m.id, d.name) });
       }
     }
     const cmd = (label, run, kbd = '', icon = I.layout) => items.push({ group: 'Commands', icon, label, kbd, run });
@@ -894,7 +910,7 @@
     $('#palette-list').innerHTML = palItems.length ? palItems.map((it, i) => {
       const head = !q && it.group !== lastGroup ? `<div class="p-group">${esc(it.group)}</div>` : '';
       lastGroup = it.group;
-      const ic = it.glyph ? glyph(it.glyph) : `<span class="glyph" style="--c:#7aa2f7">${it.icon}</span>`;
+      const ic = it.glyph ? glyph(it.glyph, '', it.m) : `<span class="glyph" style="--c:#7aa2f7">${it.icon}</span>`;
       const sub = it.sub ? `<small>${highlight(it.sub, it.label.length + 1, it.hits)}</small>` : '';
       return `${head}<div class="p-item ${i === palSel ? 'sel' : ''}" data-i="${i}" style="${it.c ? `--c:${it.c}` : ''}">${ic}`
         + `<span class="p-label"><b>${highlight(it.label, 0, it.hits)}</b>${sub}</span>${it.kbd ? `<kbd>${esc(it.kbd)}</kbd>` : ''}</div>`;
@@ -940,7 +956,7 @@
     const live = ordered().filter((s) => s.status === 'running');
     for (const id of [...S.targets]) if (!live.some((s) => s.id === id)) S.targets.delete(id);
     const agents = live.filter(isAgent);
-    $('#composer-targets').innerHTML = live.map((s) => `<button class="tchip ${S.targets.has(s.id) ? 'on' : ''}" style="--c:${s.color}" data-s="${s.id}">${glyph(s.presetId)}${esc(s.name)} <span style="color:var(--text-3)">${esc(machineById(s.machineId).name)}</span></button>`).join('')
+    $('#composer-targets').innerHTML = live.map((s) => `<button class="tchip ${S.targets.has(s.id) ? 'on' : ''}" style="--c:${s.color}" data-s="${s.id}">${glyph(s.presetId, '', s.machineId)}${esc(s.name)} <span style="color:var(--text-3)">${esc(machineById(s.machineId).name)}</span></button>`).join('')
       + (agents.length > 1 ? '<button class="tchip" data-all="agents" style="--c:#bb9af7">All agents</button>' : '')
       + (live.length ? '' : '<span class="hint">No running sessions yet</span>');
   }
@@ -997,12 +1013,14 @@
       <div class="m-form-head"><div class="m-icon">${mIcon(m)}</div><b>${esc(m.name)}</b><span class="m-kind">${ssh ? 'ssh · linux' : 'this PC'}</span><span class="spacer"></span>
         ${ssh && S.draft.machines.filter((x) => x.type === 'ssh').length > 1 ? '<button class="btn sm ghost danger" data-sact="remove">Remove</button>' : ''}</div>
       <div class="grid">
-        <div class="field ${ssh ? 'c3' : 'c4'}"><label>Name</label><input data-f="name" value="${esc(m.name)}"></div>
+        <div class="field c3"><label>Name</label><input data-f="name" value="${esc(m.name)}"></div>
         <div class="field c1"><label>Accent</label><input type="color" data-f="color" value="${esc(m.color)}"></div>
+        <div class="field c2"><label>Icon</label><select data-f="icon">${[['', 'Auto'], ['windows', 'Windows'], ['linux', 'Linux'], ['nvidia', 'NVIDIA']]
+          .map(([v, l]) => `<option value="${v}" ${(m.icon || '') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
         ${ssh ? `
-        <div class="field c2"><label>User</label><input class="mono" data-f="user" value="${esc(m.user)}" placeholder="your linux user"></div>
-        <div class="field c4"><label>Host / IP</label><input class="mono" data-f="host" value="${esc(m.host)}" placeholder="192.168.1.50 or linuxbox.local"></div>
-        <div class="field c2"><label>Port</label><input class="mono" type="number" data-f="port" value="${esc(m.port || 22)}"></div>
+        <div class="field c2"><label>User</label><input class="mono" data-f="user" value="${esc(m.user)}" placeholder="from ~/.ssh/config"></div>
+        <div class="field c3"><label>Host / IP</label><input class="mono" data-f="host" value="${esc(m.host)}" placeholder="192.168.1.50 or linuxbox.local"></div>
+        <div class="field c1"><label>Port</label><input class="mono" type="number" data-f="port" value="${esc(m.port || 22)}"></div>
         <div class="field c6"><label>Private key (optional; default tries ~/.ssh/id_ed25519, id_ecdsa, id_rsa, then ssh-agent)</label><input class="mono" data-f="keyPath" value="${esc(m.keyPath)}" placeholder="C:\\Users\\you\\.ssh\\id_ed25519"></div>` : ''}
       </div>
       ${ssh ? `<div class="m-form-actions">
