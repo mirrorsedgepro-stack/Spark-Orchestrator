@@ -55,3 +55,7 @@ Edit `presets` in the config file, e.g. a project-specific command:
 ```json
 { "id": "claude-proj", "name": "Claude · api", "color": "#E08A62", "cmd": { "linux": "cd ~/code/api && claude" } }
 ```
+
+## Credits
+
+Antigravity logo from [selfh.st/icons](https://selfh.st/icons/) (via [dashboardicons.com](https://dashboardicons.com/icons/external/google-antigravity)), licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).

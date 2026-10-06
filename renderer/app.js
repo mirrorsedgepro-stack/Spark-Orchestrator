@@ -8,7 +8,7 @@
   // ---------------------------------------------------------------- icons
   const I = {
     claude: '<svg viewBox="0 0 24 24" style="stroke-width:2.4"><path d="M12 3.5v17M3.5 12h17M6 6l12 12M18 6L6 18"/></svg>',
-    antigravity: '<svg viewBox="0 0 24 24" style="stroke-width:2.3"><path d="M4 20C6.5 12 8.8 4.5 12 4.5S17.5 12 20 20"/><path d="M8.6 14.5h6.8"/></svg>',
+    antigravity: '<img class="logo" src="../assets/google-antigravity.png" alt="" draggable="false">', // selfh.st/icons, CC BY 4.0
     gemini: '<svg viewBox="0 0 24 24"><path class="fill" d="M12 2c.7 5.3 4.7 9.3 10 10-5.3.7-9.3 4.7-10 10-.7-5.3-4.7-9.3-10-10 5.3-.7 9.3-4.7 10-10z"/></svg>',
     shell: '<svg viewBox="0 0 24 24" style="stroke-width:2.2"><path d="M5 7l5 5-5 5M12.5 18H19"/></svg>',
     gitbash: '<svg viewBox="0 0 24 24"><circle cx="6.5" cy="5.5" r="2.2"/><circle cx="6.5" cy="18.5" r="2.2"/><circle cx="17.5" cy="8" r="2.2"/><path d="M6.5 7.7v8.6M17.5 10.2c0 4.3-7 3.6-10 6.3"/></svg>',
