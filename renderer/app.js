@@ -182,6 +182,25 @@
     term.onBell(() => signal());
     term.parser.registerOscHandler(9, (data) => { if (!/^\d+;/.test(data)) signal(data); return true; });
     term.parser.registerOscHandler(777, (data) => { const [kind, , body] = data.split(';'); if (kind === 'notify') signal(body); return true; });
+    // OSC 52 clipboard writes: full-screen apps (Claude Code) copy their own mouse selections this way, through
+    // tmux. Writes only; clipboard reads ("?") are ignored so remote programs can't see your clipboard.
+    term.parser.registerOscHandler(52, (data) => {
+      const b64 = data.slice(data.indexOf(';') + 1);
+      if (!b64 || b64 === '?') return true;
+      try {
+        const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+        const text = new TextDecoder().decode(bytes);
+        if (text) { api.writeClipboard(text); toast(`Copied ${text.length} chars from ${s.name}`, 'ok', 1400); }
+      } catch { /* malformed payload */ }
+      return true;
+    });
+    // When the app owns the mouse (Claude's full-screen UI), plain drags go to the app. Shift+drag still
+    // selects in Nexus; say so once.
+    s.host.addEventListener('mousedown', (e) => {
+      if (e.button !== 0 || e.shiftKey || S.mouseTipShown || term.modes.mouseTrackingMode === 'none') return;
+      S.mouseTipShown = true;
+      toast(`${s.name} is using the mouse: select text in it to copy, or hold Shift and drag to select in Nexus.`, '', 6000);
+    }, true);
     term.onSelectionChange(() => {
       if (S.cfg.appearance.copyOnSelect && term.hasSelection()) api.writeClipboard(term.getSelection());
     });

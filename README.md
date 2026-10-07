@@ -62,6 +62,7 @@ To use password-protected keys without a prompt each run, start the Windows Open
 | Ctrl+Alt+Arrows | Move focus between panes |
 | Ctrl+Shift+Enter · Ctrl+Shift+S | Broadcast a prompt · send the focused agent's last reply |
 | Ctrl+C / Ctrl+V | Copy if text is selected (otherwise interrupt) / paste text or a screenshot |
+| Shift+drag | Select text even when the app uses the mouse (Claude Code's full-screen UI). Selecting inside Claude itself also copies to the Windows clipboard. |
 | Shift+Enter | Newline in Claude/Antigravity without submitting |
 | Ctrl+Shift+F | Find in scrollback |
 | Ctrl+Shift+W | Close (local) / detach (remote; it keeps running) |
