@@ -1,0 +1,58 @@
+name: AV check of Windows build variants
+
+# Manual: build the Windows app with and without electron-builder's executable editing (icon/version resources)
+# and scan each Nexus.exe with a freshly updated ClamAV, next to the official Electron binary. Publishes nothing.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Build (default, edits the exe)
+        shell: bash
+        run: |
+          npx electron-builder --win dir --publish never
+          mkdir -p out && cp dist/win-unpacked/Nexus.exe out/default-Nexus.exe && rm -rf dist
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - name: Build (no exe editing)
+        shell: bash
+        run: |
+          npx electron-builder --win dir --publish never -c.win.signAndEditExecutable=false
+          cp dist/win-unpacked/Nexus.exe out/noedit-Nexus.exe
+          cp node_modules/electron/dist/electron.exe out/official-electron.exe
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: exes
+          path: out/
+
+  scan:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: exes
+          path: exes
+      - name: Scan with freshly updated ClamAV
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq clamav >/dev/null
+          sudo systemctl stop clamav-freshclam || true
+          sudo freshclam --quiet || sudo freshclam
+          clamscan --version
+          sha256sum exes/*
+          for f in exes/*; do
+            if clamscan --infected --no-summary "$f" >/tmp/r 2>&1; then echo "CLEAN   $(basename "$f")"; else echo "FLAGGED $(basename "$f"): $(cat /tmp/r)"; fi
+          done
