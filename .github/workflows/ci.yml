@@ -7,7 +7,11 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -18,6 +22,8 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm test
       - name: Syntax check
+        shell: bash
         run: for f in main.js preload.js lib/*.js renderer/app.js; do node --check "$f"; done
-      - name: Bootstrap script syntax
-        run: bash -n scripts/linux-bootstrap.sh
+      - name: Shell script syntax
+        shell: bash
+        run: bash -n scripts/linux-bootstrap.sh && bash -n scripts/setup-ssh-key.sh

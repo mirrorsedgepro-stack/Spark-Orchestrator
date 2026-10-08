@@ -1,7 +1,7 @@
 name: Release
 
-# Push a tag like v1.2.0 (matching package.json "version") to build the Windows installer and publish it
-# as a GitHub release. Installed copies of Nexus pick it up automatically.
+# Push a tag like v1.3.0 (matching package.json "version") to build installers for Windows, macOS and Linux and
+# publish them as one GitHub release. Installed copies of Nexus pick it up automatically.
 on:
   push:
     tags: ['v*']
@@ -10,8 +10,33 @@ permissions:
   contents: write
 
 jobs:
-  windows:
-    runs-on: windows-latest
+  # Create the release once, before any build uploads to it (parallel uploaders would otherwise each create one).
+  create:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create release
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "${GITHUB_REF_NAME#v}" \
+            --notes "Nexus ${GITHUB_REF_NAME#v}. Windows: Nexus-Setup-*.exe · macOS: *-mac-arm64.dmg (Apple Silicon) or *-mac-x64.dmg (Intel) · Linux: .AppImage or .deb (x86_64 / arm64)."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    needs: create
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            args: --win
+          - os: macos-latest
+            args: --mac
+          - os: ubuntu-latest
+            args: --linux --x64
+          - os: ubuntu-24.04-arm
+            args: --linux --arm64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -20,13 +45,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
-      # Create the release first: electron-builder uploads with several publishers in parallel, and if none
-      # exists yet each one creates its own release for the same tag.
-      - name: Create release
-        shell: bash
-        run: gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "${GITHUB_REF_NAME#v}" --notes "Nexus ${GITHUB_REF_NAME#v}. Download Nexus-Setup-${GITHUB_REF_NAME#v}.exe below."
+      - run: npx electron-builder ${{ matrix.args }} --publish always
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - run: npx electron-builder --win nsis --publish always
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'

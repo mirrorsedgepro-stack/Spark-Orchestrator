@@ -1,6 +1,26 @@
 'use strict';
 (() => {
   const api = window.nexus;
+  const IS_MAC = api.platform === 'darwin';
+  const IS_WIN = api.platform === 'win32';
+  document.body.classList.add(`platform-${api.platform}`);
+  // App shortcuts use Cmd on macOS (Ctrl stays with the terminal there: Ctrl+C interrupts) and Ctrl elsewhere.
+  const modKey = (e) => (IS_MAC ? e.metaKey : e.ctrlKey);
+  const K = (s) => (IS_MAC ? String(s).replace(/Ctrl\+(?!Tab|`)/g, '⌘').replace(/Alt\+/g, '⌥') : s);
+  const OS_LABEL = { windows: 'Windows', mac: 'macOS', linux: 'Linux' };
+  // On macOS show ⌘/⌥ in every key hint and tooltip, including ones rendered later.
+  if (IS_MAC) {
+    const fix = (root) => {
+      if (!root.querySelectorAll) return;
+      for (const el of [root, ...root.querySelectorAll('kbd, [title]')]) {
+        if (el.tagName === 'KBD') { if (el.textContent === 'Ctrl') el.textContent = '⌘'; else if (el.textContent === 'Alt') el.textContent = '⌥'; else el.textContent = K(el.textContent); }
+        if (el.title && /Ctrl|Alt/.test(el.title)) el.title = K(el.title);
+      }
+    };
+    fix(document.body);
+    new MutationObserver((muts) => { for (const m of muts) for (const n of m.addedNodes) if (n.nodeType === 1) fix(n); })
+      .observe(document.body, { childList: true, subtree: true });
+  }
   const $ = (s, r = document) => r.querySelector(s);
   const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const now = () => Date.now();
@@ -70,7 +90,7 @@
   const isVisible = (s) => S.panes.includes(s.id);
   // Brand logos (assets/icons; credits in README). Presets/machines may name one via an `icon` field.
   const LOGO = {
-    claude: 'claude.svg', antigravity: 'google-antigravity.png', gitbash: 'git.svg', git: 'git.svg',
+    claude: 'claude.svg', antigravity: 'google-antigravity.png', gitbash: 'git.svg', git: 'git.svg', apple: 'apple.svg', ubuntu: 'ubuntu.svg',
     powershell: 'powershell.svg', terminal: 'terminal.svg', windows: 'windows.svg', linux: 'linux.svg', nvidia: 'nvidia.svg',
   };
   const logo = (k) => `<img class="logo" src="../assets/icons/${LOGO[k]}" alt="" draggable="false">`;
@@ -82,14 +102,16 @@
   const glyph = (presetId, cls = '', machineId = null) => `<span class="glyph ${cls}" style="--c:${presetById(presetId).color}">${presetIcon(presetId, machineId)}</span>`;
   function machineIconKey(m) {
     if (m.icon && LOGO[m.icon]) return m.icon;
-    if (m.type === 'local') return 'windows';
+    if (m.type === 'local') return m.os === 'mac' ? 'apple' : m.os === 'linux' ? 'linux' : 'windows';
+    if (m.type === 'wsl') return /ubuntu/i.test(m.distro || '') ? 'ubuntu' : 'linux';
     return /spark|dgx/i.test(`${(S.mstate[m.id] || {}).hostname || ''} ${m.name}`) ? 'nvidia' : 'linux';
   }
   const mIcon = (m) => logo(machineIconKey(m));
   const presetFromTmux = (name) => { const m = /^nx-([a-z0-9]+)-/.exec(name); return m ? m[1] : 'shell'; };
   const isAgent = (s) => s.presetId === 'claude' || s.presetId === 'antigravity';
   // Executable a preset launches on a machine (keys of the probe's tools map); '' = plain shell, always present.
-  const toolOf = (m, p) => (p.id === 'gitbash' ? 'gitbash' : String((p.cmd || {})[m.os] || '').split(/\s+/)[0]);
+  const presetCmd = (m, p) => { const c = p.cmd || {}; return c[m.os] != null ? c[m.os] : m.os === 'mac' ? (c.linux || '') : ''; };
+  const toolOf = (m, p) => (p.id === 'gitbash' ? 'gitbash' : String(presetCmd(m, p)).split(/\s+/)[0]);
   const isMissing = (m, p) => { const t = toolOf(m, p); return !!t && ((S.mstate[m.id] || {}).tools || {})[t] === false; };
 
   // ---------------------------------------------------------------- terminal theme
@@ -110,7 +132,7 @@
       drawBoldTextInBrightColors: false, minimumContrastRatio: 1, rescaleOverlappingGlyphs: true,
       theme: { ...THEME, cursor: color, cursorAccent: '#0b0f18' },
     };
-    if (machine.type === 'local') o.windowsPty = { backend: 'conpty', buildNumber: 26100 };
+    if (IS_WIN && (machine.type === 'local' || machine.type === 'wsl')) o.windowsPty = { backend: 'conpty', buildNumber: 26100 };
     return o;
   }
 
@@ -213,6 +235,10 @@
       clearDone(s);
     });
     s.host.addEventListener('contextmenu', (e) => { e.preventDefault(); termMenu(e, s); });
+    // Native paste (macOS Edit menu, middle-click on Linux) with no text: treat it as an image paste.
+    term.textarea.addEventListener('paste', (e) => {
+      if (e.clipboardData && !e.clipboardData.getData('text/plain')) { e.preventDefault(); pasteInto(s); }
+    }, true);
     // Drop files onto a pane: local paths are pasted as-is, remote ones are uploaded first.
     s.host.addEventListener('dragover', (e) => { if (e.dataTransfer.types.includes('Files')) { e.preventDefault(); s.host.classList.add('drop'); } });
     s.host.addEventListener('dragleave', () => s.host.classList.remove('drop'));
@@ -227,7 +253,7 @@
   // Quote a path for the session's shell / agent prompt.
   function quotePath(s, p) {
     if (!/[\s'"&()]/.test(p)) return p;
-    return machineById(s.machineId).type === 'local' ? `"${p}"` : `'${p.replace(/'/g, `'\\''`)}'`;
+    return machineById(s.machineId).type === 'local' && IS_WIN ? `"${p}"` : `'${p.replace(/'/g, `'\\''`)}'`;
   }
 
   async function attachFiles(s, paths) {
@@ -334,8 +360,12 @@
   function installHint(m, presetId) {
     const p = presetById(presetId);
     if (m.type === 'ssh') return `${p.name} isn't installed on ${m.name}. Use "Install tools" from the machine's ⋯ menu.`;
-    if (presetId === 'claude') return 'Claude Code isn\'t on PATH here. Install it: npm install -g @anthropic-ai/claude-code';
-    if (presetId === 'antigravity') return 'Antigravity CLI (agy) isn\'t installed here. In PowerShell: irm https://antigravity.google/cli/install.ps1 | iex';
+    if (m.type === 'wsl') {
+      if (presetId === 'claude') return `Claude Code isn't installed in ${m.distro}. In a WSL shell: curl -fsSL https://claude.ai/install.sh | bash`;
+      if (presetId === 'antigravity') return `Antigravity isn't installed in ${m.distro}. In a WSL shell: curl -fsSL https://antigravity.google/cli/install.sh | bash`;
+    }
+    if (presetId === 'claude') return IS_WIN ? 'Claude Code isn\'t installed here. In PowerShell: irm https://claude.ai/install.ps1 | iex' : 'Claude Code isn\'t installed here. In a terminal: curl -fsSL https://claude.ai/install.sh | bash';
+    if (presetId === 'antigravity') return IS_WIN ? 'Antigravity CLI (agy) isn\'t installed here. In PowerShell: irm https://antigravity.google/cli/install.ps1 | iex' : 'Antigravity CLI (agy) isn\'t installed here. In a terminal: curl -fsSL https://antigravity.google/cli/install.sh | bash';
     return `${p.name} isn't available on ${m.name}.`;
   }
 
@@ -707,7 +737,9 @@
   function machineCard(m) {
     const st = S.mstate[m.id] || {};
     const status = m.type === 'local' ? 'online' : (st.status || 'offline');
-    const sub = m.type === 'local' ? 'local · Windows' : (m.host ? `${m.user ? m.user + '@' : ''}${m.host}` : 'not configured');
+    const sub = m.type === 'local' ? `local · ${OS_LABEL[m.os] || ''}`
+      : m.type === 'wsl' ? `WSL · ${m.distro}${st.user ? ` · ${st.user}` : ''}`
+      : (m.host ? `${m.user ? m.user + '@' : ''}${m.host}` : 'not configured');
     const sessions = ordered().filter((s) => s.machineId === m.id);
     const openNames = new Set(sessions.map((s) => s.tmuxName).filter(Boolean));
     const detached = (st.detached || []).filter((d) => !openNames.has(d.name));
@@ -937,6 +969,9 @@
     api.answerPassphrase(id, v);
   });
 
+  api.onUpdateAvailable(({ version, url }) => {
+    toast(`Nexus ${version} is available.`, 'ok', 60000, { label: 'Download', run: () => window.open(url) });
+  });
   api.onUpdateReady((version) => {
     toast(`Nexus ${version} is ready to install.`, 'ok', 60000, { label: 'Restart now', run: () => api.installUpdate() });
   });
@@ -999,6 +1034,7 @@
   // ---------------------------------------------------------------- machines
   async function connectMachine(id, { quiet = false } = {}) {
     delete S.manualDisconnect[id];
+    if (machineById(id).type === 'wsl') { await refreshMachine(id); return (S.mstate[id] || {}).status === 'online'; }
     if (!quiet) { S.mstate[id] = { ...(S.mstate[id] || {}), status: 'connecting', error: null }; renderChrome(); }
     const r = await api.connect(id);
     if (!r.ok) { S.mstate[id] = { ...S.mstate[id], status: 'error', error: r.error }; renderChrome(); return false; }
@@ -1008,7 +1044,7 @@
 
   async function refreshMachine(id) {
     const m = machineById(id);
-    if (m.type !== 'ssh' || !m.host) return;
+    if (!(m.type === 'wsl' || (m.type === 'ssh' && (m.host || m.tsHost)))) return;
     const r = await api.probe(id);
     const st = (S.mstate[id] = S.mstate[id] || {});
     if (!r.ok) { st.status = 'error'; st.error = r.error; renderChrome(); return; }
@@ -1124,7 +1160,10 @@
     if (e.type !== 'keydown') return true;
     if (handleShortcut(e)) { e.preventDefault(); e.stopPropagation(); return false; }
     const k = e.key.toLowerCase();
-    if (e.ctrlKey && !e.altKey) {
+    // macOS: Cmd+C/V go through the Edit menu's native copy/paste, which xterm handles (a clipboard holding only an
+    // image is caught by the paste listener below). Other Cmd combos belong to the app, never to the shell.
+    if (IS_MAC && e.metaKey) return false;
+    if (!IS_MAC && e.ctrlKey && !e.altKey) {
       if (k === 'c' && (e.shiftKey || s.term.hasSelection())) { copySelection(s); e.preventDefault(); return false; }
       if (k === 'v') { e.preventDefault(); pasteInto(s); return false; }
     }
@@ -1140,7 +1179,7 @@
 
   function handleShortcut(e) {
     const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
-    const c = e.ctrlKey, sh = e.shiftKey, a = e.altKey;
+    const c = modKey(e), sh = e.shiftKey, a = e.altKey;
     if (c && sh && !a && (k === 'p' || k === 'k')) { openPalette(); return true; }
     if (c && sh && k === 't') { openPalette('new '); return true; }
     if (c && sh && k === 'Enter') { toggleComposer(); return true; }
@@ -1153,8 +1192,8 @@
     if (c && sh && k === 'm') { toggleTeam(); return true; }
     if (c && sh && k === 'n') { openPalette('in folder '); return true; }
     if (c && !sh && !a && /^[1-9]$/.test(k)) { const s = ordered()[Number(k) - 1]; if (s) show(s.id); return true; }
-    if (c && k === 'Tab') { cycle(sh ? -1 : 1); return true; }
-    if (c && !sh && k === '`') { const id = S.mru[1]; if (id) show(id); return true; }
+    if (e.ctrlKey && k === 'Tab') { cycle(sh ? -1 : 1); return true; }
+    if (e.ctrlKey && !sh && k === '`') { const id = S.mru[1]; if (id) show(id); return true; }
     if (c && a && k.startsWith('Arrow')) { movePaneFocus(k); return true; }
     if (c && !sh && k === ',') { openSettings(); return true; }
     if (c && !sh && (k === '=' || k === '+')) { bumpFont(1); return true; }
@@ -1492,7 +1531,7 @@
   function machineForm(m, i) {
     const ssh = m.type === 'ssh';
     return `<div class="m-form" data-mi="${i}" style="--c:${m.color}">
-      <div class="m-form-head"><div class="m-icon">${mIcon(m)}</div><b>${esc(m.name)}</b><span class="m-kind">${ssh ? 'ssh · linux' : 'this PC'}</span><span class="spacer"></span>
+      <div class="m-form-head"><div class="m-icon">${mIcon(m)}</div><b>${esc(m.name)}</b><span class="m-kind">${ssh ? 'ssh · linux' : m.type === 'wsl' ? `wsl · ${esc(m.distro)}` : `this computer · ${OS_LABEL[m.os] || ''}`}</span><span class="spacer"></span>
         ${ssh && S.draft.machines.filter((x) => x.type === 'ssh').length > 1 ? '<button class="btn sm ghost danger" data-sact="remove">Remove</button>' : ''}</div>
       <div class="grid">
         <div class="field c3"><label>Name</label><input data-f="name" value="${esc(m.name)}"></div>
@@ -1768,8 +1807,12 @@
     if (act === 'close') return closeShare();
     if (act === 'refresh') return busy('refresh', () => refreshShare());
     if (act === 'install') {
+      if (IS_MAC) return window.open('https://tailscale.com/download/mac');
       closeShare();
-      return launch('local', 'shell', { cmd: 'winget install -e --id Tailscale.Tailscale', name: 'Install Tailscale' });
+      return launch('local', 'shell', {
+        cmd: IS_WIN ? 'winget install -e --id Tailscale.Tailscale' : 'curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up',
+        name: 'Install Tailscale',
+      });
     }
     if (act === 'join') {
       const m = machineById(b.dataset.m);
@@ -2143,7 +2186,9 @@
     renderAll();
     // Bring back last time's sessions: remote ones reattach to their tmux session, local ones restart in their folder.
     if (S.cfg.appearance.restoreSession !== false && S.cfg.lastSession) await openLayout(S.cfg.lastSession, { resume: true });
-    for (const m of S.cfg.machines) if (m.type === 'ssh' && m.host && (S.mstate[m.id] || {}).status !== 'online') connectMachine(m.id);
+    for (const m of S.cfg.machines) {
+      if ((m.type === 'ssh' && (m.host || m.tsHost)) || m.type === 'wsl') if ((S.mstate[m.id] || {}).status !== 'online') connectMachine(m.id);
+    }
     api.appInfo().then((i) => { S.version = i.version; });
     TM.status = collabCfg().status || '';
     initTeam();

@@ -5,6 +5,7 @@ const os = require('os');
 const { StringDecoder } = require('string_decoder');
 const config = require('./lib/config');
 const local = require('./lib/local');
+const platform = require('./lib/platform');
 const { Machine } = require('./lib/remote');
 const tailscale = require('./lib/tailscale');
 const collab = require('./lib/collab');
@@ -89,8 +90,9 @@ function createWindow() {
     backgroundColor: '#090c13',
     title: 'Nexus',
     icon: ICON,
-    titleBarStyle: 'hidden',
-    titleBarOverlay: { color: '#090c13', symbolColor: '#8b93a8', height: 42 },
+    ...(platform.IS_MAC
+      ? { titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 14, y: 14 } }
+      : { titleBarStyle: 'hidden', titleBarOverlay: { color: '#090c13', symbolColor: '#8b93a8', height: 42 } }),
     show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -114,8 +116,19 @@ function createWindow() {
 }
 
 // ---- auto-update (installed builds only; releases on GitHub) ----
+async function checkReleaseNotice() {
+  try {
+    const r = await fetch('https://api.github.com/repos/mirrorsedgepro-stack/Spark-Orchestrator/releases/latest', { headers: { Accept: 'application/vnd.github+json' } });
+    if (!r.ok) return;
+    const rel = await r.json();
+    const v = String(rel.tag_name || '').replace(/^v/, '');
+    const newer = (a, b) => { const x = a.split('.').map(Number), y = b.split('.').map(Number); for (let i = 0; i < 3; i++) { if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0); } return false; };
+    if (v && newer(v, app.getVersion())) send('update:available', { version: v, url: rel.html_url });
+  } catch { /* offline */ }
+}
 function setupUpdates() {
   if (!app.isPackaged) return;
+  if (platform.IS_MAC) { setTimeout(checkReleaseNotice, 8000); setInterval(checkReleaseNotice, 6 * 60 * 60 * 1000); return; }
   let autoUpdater;
   try { ({ autoUpdater } = require('electron-updater')); } catch { return; }
   autoUpdater.autoDownload = true;
@@ -127,8 +140,30 @@ function setupUpdates() {
   ipcMain.on('update:install', () => autoUpdater.quitAndInstall());
 }
 
-Menu.setApplicationMenu(null);
-app.whenReady().then(() => { createWindow(); setupUpdates(); });
+Menu.setApplicationMenu(platform.IS_MAC ? Menu.buildFromTemplate([{ role: 'appMenu' }, { role: 'editMenu' }]) : null);
+
+// On Windows, offer each WSL distro as its own machine (once; deleting it in Settings sticks).
+async function addWslMachines() {
+  const distros = await platform.listWsl();
+  if (!distros.length) return;
+  const c = config.load();
+  c.wslSeen = c.wslSeen || {};
+  let changed = false;
+  for (const d of distros) {
+    if (c.wslSeen[d.name]) continue;
+    c.wslSeen[d.name] = true;
+    changed = true;
+    if (c.machines.some((m) => m.type === 'wsl' && m.distro === d.name)) continue;
+    c.machines.push({ id: 'wsl-' + d.name.toLowerCase().replace(/[^a-z0-9]+/g, '-'), name: `WSL · ${d.name}`, type: 'wsl', os: 'linux', distro: d.name, color: '#E95420' });
+  }
+  if (changed) config.save(c);
+}
+
+app.whenReady().then(async () => {
+  await Promise.all([platform.loadLoginShellPath(), addWslMachines().catch(() => {})]);
+  createWindow();
+  setupUpdates();
+});
 app.on('second-instance', () => { if (win) { if (win.isMinimized()) win.restore(); win.focus(); } });
 app.on('window-all-closed', () => {
   for (const s of sessions.values()) { try { s.close(); } catch {} }
@@ -192,9 +227,15 @@ const safe = (fn) => async (...a) => { try { return { ok: true, ...(await fn(...
 ipcMain.handle('local:probe', () => local.probe());
 ipcMain.handle('machine:connect', safe(async (_e, id) => { await getMachine(id).connect(); }));
 ipcMain.handle('machine:disconnect', (_e, id) => { getMachine(id).disconnect(); return true; });
-ipcMain.handle('machine:probe', safe((_e, id) => getMachine(id).probe()));
+ipcMain.handle('machine:probe', safe((_e, id) => {
+  const m = machineCfg(id);
+  return m && m.type === 'wsl' ? local.wslProbe(m.distro) : getMachine(id).probe();
+}));
 ipcMain.handle('machine:stats', safe(async (_e, id) => ({ stats: await getMachine(id).stats() })));
-ipcMain.handle('machine:dirs', safe((_e, id) => getMachine(id).listDirs()));
+ipcMain.handle('machine:dirs', safe((_e, id) => {
+  const m = machineCfg(id);
+  return m && m.type === 'wsl' ? local.wslDirs(m.distro) : getMachine(id).listDirs();
+}));
 ipcMain.handle('machine:setup-alerts', safe(async (_e, id) => ({ added: await getMachine(id).setupAlerts() })));
 ipcMain.handle('machine:kill-tmux', async (_e, id, name) => { await getMachine(id).killTmux(name); return true; });
 ipcMain.handle('machine:upload-bootstrap', safe(async (_e, id) => {
@@ -205,7 +246,7 @@ ipcMain.handle('local:dirs', safe(async () => {
   // Folders under the user profile that look like projects (contain .git), plus top-level folders.
   const home = os.homedir();
   const repos = [], dirs = [];
-  const skip = new Set(['node_modules', 'AppData', '.git', '.cache']);
+  const skip = new Set(['node_modules', 'AppData', '.git', '.cache', 'Library', 'Applications', 'snap']);
   const walk = (dir, depth) => {
     let entries;
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
@@ -356,23 +397,25 @@ ipcMain.handle('session:create', async (_e, spec) => {
   const m = cfg.machines.find((x) => x.id === spec.machineId);
   if (!m) return { ok: false, error: 'Unknown machine' };
   const preset = cfg.presets.find((p) => p.id === spec.presetId) || { id: 'shell', cmd: {} };
-  const cmd = spec.cmd != null ? spec.cmd : ((preset.cmd || {})[m.os] || '');
+  const pc = preset.cmd || {};
+  const cmd = spec.cmd != null ? spec.cmd : (pc[m.os] != null ? pc[m.os] : m.os === 'mac' ? (pc.linux || '') : '');
   const cols = Math.max(20, spec.cols || 120), rows = Math.max(5, spec.rows || 30);
   const id = `s${nextId++}`;
 
   try {
-    if (m.type === 'local') {
+    if (m.type === 'local' || m.type === 'wsl') {
       let script = null;
       if (spec.script === 'setup-ssh-key') {
         const target = machineCfg(spec.scriptMachine);
         script = {
-          file: path.join(SCRIPTS_DIR, 'setup-ssh-key.ps1'),
-          args: ['-HostName', target.host, '-User', target.user || '', '-Port', String(target.port || 22)],
+          ...(platform.IS_WIN
+            ? { file: path.join(SCRIPTS_DIR, 'setup-ssh-key.ps1'), args: ['-HostName', target.host, '-User', target.user || '', '-Port', String(target.port || 22)] }
+            : { file: path.join(SCRIPTS_DIR, 'setup-ssh-key.sh'), args: [target.host, target.user || '', String(target.port || 22)] }),
         };
       }
-      let cwd = expandLocal(spec.cwd);
-      if (cwd && !fs.existsSync(cwd)) cwd = undefined;
-      const p = local.spawn({ cmd, cols, rows, script, cwd });
+      let cwd = m.type === 'wsl' ? spec.cwd : expandLocal(spec.cwd); // WSL paths are resolved inside the distro
+      if (cwd && m.type !== 'wsl' && !fs.existsSync(cwd)) cwd = undefined;
+      const p = local.spawn({ cmd, cols, rows, script, cwd, wsl: m.type === 'wsl' ? m.distro : null });
       sessions.set(id, {
         machineId: m.id,
         write: (d) => p.write(d),
@@ -440,12 +483,13 @@ ipcMain.handle('session:paste-image', safe(async (_e, id) => {
   if (img.isEmpty()) return { path: null };
   const png = img.toPNG();
   const name = `paste-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
-  if (machineCfg(s.machineId).type === 'local') {
+  const type = machineCfg(s.machineId).type;
+  if (type === 'local' || type === 'wsl') {
     const dir = path.join(app.getPath('temp'), 'nexus-paste');
     fs.mkdirSync(dir, { recursive: true });
     const p = path.join(dir, name);
     fs.writeFileSync(p, png);
-    return { path: p };
+    return { path: type === 'wsl' ? platform.toWslPath(p) : p };
   }
   return { path: await getMachine(s.machineId).uploadToInbox(name, { buffer: png }) };
 }));
@@ -458,7 +502,9 @@ ipcMain.handle('session:upload-files', safe(async (_e, id, files) => {
   for (const f of files) {
     const st = fs.statSync(f);
     if (st.isDirectory()) throw new Error(`${path.basename(f)} is a folder; drop files instead`);
-    if (machineCfg(s.machineId).type === 'local') { out.push(f); continue; }
+    const type = machineCfg(s.machineId).type;
+    if (type === 'local') { out.push(f); continue; }
+    if (type === 'wsl') { out.push(platform.toWslPath(f)); continue; } // WSL sees Windows drives under /mnt
     if (st.size > 512 * 1024 * 1024) throw new Error(`${path.basename(f)} is larger than 512 MB`);
     out.push(await getMachine(s.machineId).uploadToInbox(path.basename(f), { localPath: f }));
   }

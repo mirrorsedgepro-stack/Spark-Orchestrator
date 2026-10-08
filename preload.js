@@ -7,6 +7,7 @@ const on = (ch) => (fn) => {
 };
 
 contextBridge.exposeInMainWorld('nexus', {
+  platform: process.platform,
   hello: () => ipcRenderer.send('app:hello'),
   getConfig: () => ipcRenderer.invoke('config:get'),
   saveConfig: (cfg) => ipcRenderer.invoke('config:save', cfg),
@@ -67,4 +68,5 @@ contextBridge.exposeInMainWorld('nexus', {
   onFocus: on('app:focus'),
   onAuthAsk: on('auth:ask'),
   onUpdateReady: on('update:ready'),
+  onUpdateAvailable: on('update:available'),
 });

@@ -425,3 +425,8 @@ body.team-open .composer { left: calc(50% - 176px); }
 .s-who .ava + .ava { margin-left: -5px; }
 #btn-team { position: relative; }
 #btn-team .badge { position: absolute; top: 1px; right: 0; min-width: 15px; height: 15px; padding: 0 4px; border-radius: 8px; background: #bb9af7; color: #0b0f18; font: 700 9.5px/15px var(--ui); text-align: center; }
+
+/* ---------- per-OS window chrome ---------- */
+/* macOS: traffic lights sit at the left of our title bar; no overlay buttons on the right. */
+.platform-darwin #titlebar { padding: 0 14px 0 82px; }
+.platform-darwin .brand { width: 170px; }

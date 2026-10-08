@@ -1,18 +1,35 @@
 # Nexus
 
-One Windows terminal for Claude Code, the Antigravity CLI (`agy`) and shells, on this PC and on your Linux machines (e.g. DGX Sparks) over SSH.
+One terminal for Claude Code, the Antigravity CLI (`agy`) and shells: on your own computer (Windows, macOS, Linux,
+or a WSL distro) and on your Linux machines (e.g. DGX Sparks) over SSH or Tailscale, with team chat so several people
+can share the machines without stepping on each other.
 
 ## Install
 
-**Installer:** download `Nexus-Setup-x.y.z.exe` from [Releases](https://github.com/mirrorsedgepro-stack/Spark-Orchestrator/releases). Installed copies update themselves from new releases. The installer is unsigned, so Windows SmartScreen asks once ("More info → Run anyway").
+Download from [Releases](https://github.com/mirrorsedgepro-stack/Spark-Orchestrator/releases):
 
-**From source:**
+| OS | File | Notes |
+|---|---|---|
+| Windows 10/11 | `Nexus-Setup-x.y.z.exe` | Updates itself. Unsigned: SmartScreen asks once (More info → Run anyway). |
+| macOS (Apple Silicon / Intel) | `Nexus-x.y.z-mac-arm64.dmg` / `…-mac-x64.dmg` | Unsigned: the first time, right-click Nexus in Applications → Open. Nexus tells you when a new version is out. |
+| Linux x86_64 / arm64 | `.AppImage` (updates itself) or `.deb` | AppImage: `chmod +x Nexus-*.AppImage` and run. Needs `openssh-client`. |
+
+**From source** (any OS, Node 22+):
 
 ```
 npm install && node node_modules/electron/install.js
-Start-Nexus.cmd                          # or: npm start
-powershell -File install-shortcut.ps1    # optional: Start menu + desktop shortcut
+npm start                                # Windows also: Start-Nexus.cmd
 ```
+
+### Per-OS behaviour
+
+- **Windows:** local sessions run in PowerShell (pwsh if installed) or Git Bash. **Each WSL distro gets its own machine card**
+  (e.g. "WSL · Ubuntu") with Claude / Antigravity / Shell running *inside* the distro; dropped files and pasted
+  screenshots arrive as `/mnt/c/...` paths.
+- **macOS:** local sessions use your login shell (zsh). Shortcuts use **⌘** (⌘⇧P palette, ⌘1…9, ⌘C / ⌘V); **Ctrl+C**
+  always reaches the terminal. Nexus loads your login shell's PATH, so tools from Homebrew or `~/.local/bin` are found
+  even when launched from Finder.
+- **Linux:** local sessions use your login shell; shortcuts as on Windows (Ctrl+Shift+…).
 
 ## First-time setup for a Linux machine
 
@@ -65,6 +82,19 @@ login users; no keys or tokens.
 > Tip: Spark 1 currently has `/etc/ssh/sshd_config.d/99-temp-pw.conf` enabling SSH password logins. Tailscale SSH doesn't
 > need it; consider removing it (`sudo rm /etc/ssh/sshd_config.d/99-temp-pw.conf && sudo systemctl reload ssh`) once your key works.
 
+## Team chat and deconfliction
+
+Open with the chat icon in the title bar (Ctrl+Shift+M / ⌘⇧M). Everyone using the same Sparks lands in the same chat
+automatically: it lives on one Spark (`~/.nexus/collab`, by default the one whose hostname sorts first; override in
+Settings) and travels over each person's existing SSH connection, so there's no extra server or port.
+
+- **Who's doing what:** the people list shows everyone online, their status (`/status Training on Spark 2 until 3pm`)
+  and which agent sessions they have open. The sidebar shows avatars on sessions someone else is also in.
+- **Before you collide:** opening a session someone else has open asks first, offering **Watch read-only**
+  (`tmux attach -r`). Starting an agent in a folder where someone's agent already runs warns you and offers to
+  message them. Optionally, Nexus posts "started Claude in ~/project on spark1" when you launch an agent.
+- **@mentions** raise a notification. The chat keeps the last ~2000 messages.
+
 ## How it works
 
 | | |
@@ -87,6 +117,7 @@ To use password-protected keys without a prompt each run, start the Windows Open
 | Ctrl+Shift+L · Ctrl+Shift+D | Cycle layout (1 / 2 / 4 panes) · open current side by side |
 | Ctrl+Alt+Arrows | Move focus between panes |
 | Ctrl+Shift+Enter · Ctrl+Shift+S | Broadcast a prompt · send the focused agent's last reply |
+| Ctrl+Shift+M | Team chat |
 | Ctrl+C / Ctrl+V | Copy if text is selected (otherwise interrupt) / paste text or a screenshot |
 | Shift+drag | Select text even when the app uses the mouse (Claude Code's full-screen UI). Selecting inside Claude itself also copies to the Windows clipboard. |
 | Shift+Enter | Newline in Claude/Antigravity without submitting |
