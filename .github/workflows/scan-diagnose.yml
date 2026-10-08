@@ -57,3 +57,27 @@ jobs:
           mkdir -p electron-official && 7z x -y -bd electron.zip -oelectron-official >/dev/null
           sha256sum electron-official/electron.exe
           clamscan --infected --no-summary electron-official/electron.exe && echo "official electron.exe: clean" || echo "official electron.exe: FLAGGED (above)"
+
+  # Second engine on the exact flagged binary: Microsoft Defender on a Windows runner.
+  defender:
+    runs-on: windows-latest
+    steps:
+      - name: Download and unpack the installer
+        shell: bash
+        run: |
+          mkdir -p dl && gh release download "${{ inputs.tag }}" --repo "$GITHUB_REPOSITORY" --dir dl --pattern '*.exe'
+          7z x -y -bd dl/*.exe -ox >/dev/null && 7z x -y -bd 'x/$PLUGINSDIR/app-64.7z' -ox/app >/dev/null
+          sha256sum dl/*.exe x/app/Nexus.exe
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Microsoft Defender scan
+        shell: pwsh
+        run: |
+          $mp = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+          if (-not (Test-Path $mp)) { Write-Host "Defender is not available on this runner"; exit 0 }
+          & $mp -SignatureUpdate | Select-Object -Last 1
+          (Get-MpComputerStatus).AntivirusSignatureVersion
+          foreach ($f in (Get-ChildItem dl/*.exe) + (Get-Item x/app/Nexus.exe)) {
+            Write-Host "== $($f.Name)"
+            & $mp -Scan -ScanType 3 -File $f.FullName -DisableRemediation | Select-Object -Last 2
+          }
