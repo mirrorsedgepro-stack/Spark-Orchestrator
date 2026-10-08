@@ -12,7 +12,7 @@ Download from [Releases](https://github.com/mirrorsedgepro-stack/Spark-Orchestra
 |---|---|---|
 | Windows 10/11 | `Nexus-Setup-x.y.z.exe` | Updates itself. Unsigned: SmartScreen asks once (More info → Run anyway). |
 | macOS (Apple Silicon / Intel) | `Nexus-x.y.z-mac-arm64.dmg` / `…-mac-x64.dmg` | Unsigned: the first time, right-click Nexus in Applications → Open. Nexus tells you when a new version is out. |
-| Linux x86_64 / arm64 | `.AppImage` (updates itself) or `.deb` | AppImage: `chmod +x Nexus-*.AppImage` and run. Needs `openssh-client`. |
+| Linux x86_64 / arm64 (Debian, Ubuntu, DGX OS…) | `Nexus-x.y.z-linux-amd64.deb` / `…-linux-arm64.deb` | `sudo apt install ./Nexus-*.deb`. Other distros: run from source. |
 
 **From source** (any OS, Node 22+):
 

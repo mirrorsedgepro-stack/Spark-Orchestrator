@@ -20,7 +20,7 @@ jobs:
         run: |
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --title "${GITHUB_REF_NAME#v}" \
-            --notes "Nexus ${GITHUB_REF_NAME#v}. Windows: Nexus-Setup-*.exe · macOS: *-mac-arm64.dmg (Apple Silicon) or *-mac-x64.dmg (Intel) · Linux: .AppImage or .deb (x86_64 / arm64)."
+            --notes "Nexus ${GITHUB_REF_NAME#v}. Windows: Nexus-Setup-*.exe · macOS: *-mac-arm64.dmg (Apple Silicon) or *-mac-x64.dmg (Intel) · Linux: .deb (x86_64 / arm64)."
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
