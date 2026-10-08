@@ -1,0 +1,49 @@
+name: Scan diagnose
+
+# Manual: find out exactly which file inside a release's installers an antivirus signature matches, using a freshly
+# updated ClamAV from Ubuntu (independent of the release scan's image). Nothing is published or changed.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to inspect (may be a draft)
+        required: true
+      compare_tag:
+        description: Another release tag to scan for comparison (optional)
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install ClamAV + 7-Zip and update signatures
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq clamav p7zip-full >/dev/null
+          sudo systemctl stop clamav-freshclam || true
+          sudo freshclam --quiet || sudo freshclam
+          clamscan --version
+      - name: Download installers
+        run: |
+          mkdir -p dl/new dl/old
+          gh release download "${{ inputs.tag }}" --repo "$GITHUB_REPOSITORY" --dir dl/new --pattern '*.exe'
+          if [ -n "${{ inputs.compare_tag }}" ]; then gh release download "${{ inputs.compare_tag }}" --repo "$GITHUB_REPOSITORY" --dir dl/old --pattern '*.exe'; fi
+          sha256sum dl/*/*
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Scan the installers as shipped
+        run: clamscan --no-summary --infected dl/new dl/old || true
+      - name: Unpack the NSIS installers and scan every file inside
+        run: |
+          for exe in dl/*/*.exe; do
+            out="x/$(basename "$(dirname "$exe")")"
+            mkdir -p "$out"
+            7z x -y -bd "$exe" -o"$out" >/dev/null
+            for inner in $(find "$out" -name '*.7z'); do 7z x -y -bd "$inner" -o"${inner%.7z}" >/dev/null; done
+          done
+          echo "== files flagged inside the installers =="
+          clamscan -r --infected --no-summary --max-filesize=500M --max-scansize=2000M x || true
+          echo "== executables inside the new installer =="
+          find x/new -iname '*.exe' -o -iname '*.dll' -o -iname '*.node' | sort | head -80
