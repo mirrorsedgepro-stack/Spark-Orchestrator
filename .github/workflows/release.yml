@@ -1,6 +1,6 @@
 name: Release
 
-# Push a tag like v1.1.0 (matching package.json "version") to build the Windows installer and publish it
+# Push a tag like v1.2.0 (matching package.json "version") to build the Windows installer and publish it
 # as a GitHub release. Installed copies of Nexus pick it up automatically.
 on:
   push:
@@ -13,13 +13,20 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
       - run: npm ci
       - run: npm test
+      # Create the release first: electron-builder uploads with several publishers in parallel, and if none
+      # exists yet each one creates its own release for the same tag.
+      - name: Create release
+        shell: bash
+        run: gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "${GITHUB_REF_NAME#v}" --notes "Nexus ${GITHUB_REF_NAME#v}. Download Nexus-Setup-${GITHUB_REF_NAME#v}.exe below."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - run: npx electron-builder --win nsis --publish always
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
