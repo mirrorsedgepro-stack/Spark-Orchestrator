@@ -142,7 +142,7 @@ npm test        # unit tests (ssh_config, known_hosts, remote commands, alert ho
 npm run dist    # build dist/Nexus-Setup-<version>.exe
 ```
 
-CI runs the tests on every push. To publish a release, bump `version` in `package.json`, then push a matching tag (`git tag v1.1.0 && git push --tags`); the Release workflow builds the installer and attaches it to a GitHub release, and installed copies update from it.
+CI runs the tests on Windows, macOS and Linux on every push. To publish a release, bump `version` in `package.json`, then push a matching tag (`git tag v1.3.0 && git push --tags`). The Release workflow builds the Windows, macOS and Linux installers into a **draft** release, scans them all with ClamAV ([hugoalh/scan-virus-ghaction](https://github.com/hugoalh/scan-virus-ghaction)), and publishes the release only if nothing is found, with the scan result and SHA-256 checksums in its notes. Installed copies update from it.
 
 ## Credits
 

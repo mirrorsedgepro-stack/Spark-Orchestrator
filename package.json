@@ -81,7 +81,7 @@
         "provider": "github",
         "owner": "mirrorsedgepro-stack",
         "repo": "Spark-Orchestrator",
-        "releaseType": "release"
+        "releaseType": "draft"
       }
     ],
     "mac": {
