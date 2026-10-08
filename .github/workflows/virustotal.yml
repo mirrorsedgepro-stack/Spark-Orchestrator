@@ -1,0 +1,64 @@
+name: VirusTotal check
+
+# Manual: get a multi-engine VirusTotal verdict for a release's Windows installer (draft releases included).
+# Needs a repository secret VT_API_KEY (a free VirusTotal API key). Looks the file up by hash first and only
+# uploads it if VirusTotal hasn't seen it. Publishes nothing.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag whose installers to check
+        required: true
+      pattern:
+        description: Asset name pattern
+        required: false
+        default: '*.exe'
+
+permissions:
+  contents: write # needed only to read draft releases; nothing is modified
+
+jobs:
+  virustotal:
+    runs-on: ubuntu-latest
+    env:
+      VT: ${{ secrets.VT_API_KEY }}
+    steps:
+      - name: Check the API key is configured
+        run: '[ -n "$VT" ] || { echo "::error::Add the VT_API_KEY repository secret first"; exit 1; }'
+      - name: Download installers
+        run: |
+          mkdir -p dl && gh release download "${{ inputs.tag }}" --repo "$GITHUB_REPOSITORY" --dir dl --pattern '${{ inputs.pattern }}'
+          ls -la dl
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Scan with VirusTotal
+        run: |
+          set -euo pipefail
+          api=https://www.virustotal.com/api/v3
+          for f in dl/*; do
+            sha=$(sha256sum "$f" | cut -d' ' -f1)
+            echo "== $(basename "$f")  sha256=$sha"
+            code=$(curl -s -o report.json -w '%{http_code}' -H "x-apikey: $VT" "$api/files/$sha")
+            if [ "$code" != "200" ]; then
+              echo "Not known to VirusTotal yet: uploading ($(du -h "$f" | cut -f1))"
+              url=$(curl -sf -H "x-apikey: $VT" "$api/files/upload_url" | jq -r .data)
+              id=$(curl -sf -H "x-apikey: $VT" -F "file=@$f" "$url" | jq -r .data.id)
+              for i in $(seq 1 60); do
+                st=$(curl -sf -H "x-apikey: $VT" "$api/analyses/$id" | jq -r .data.attributes.status)
+                [ "$st" = "completed" ] && break
+                sleep 30
+              done
+              sleep 20
+              curl -sf -H "x-apikey: $VT" "$api/files/$sha" -o report.json
+            fi
+            jq -r '.data.attributes.last_analysis_stats | "verdict: \(.malicious) malicious, \(.suspicious) suspicious, \(.undetected) undetected, \(.harmless) harmless, \(."type-unsupported" // 0) unsupported"' report.json
+            echo "engines that flag it:"
+            jq -r '.data.attributes.last_analysis_results | to_entries[] | select(.value.category=="malicious" or .value.category=="suspicious") | "  \(.key): \(.value.result)"' report.json
+            echo "report: https://www.virustotal.com/gui/file/$sha"
+            {
+              echo "### $(basename "$f")"
+              jq -r '.data.attributes.last_analysis_stats | "**\(.malicious) malicious, \(.suspicious) suspicious** of \(.malicious + .suspicious + .undetected + .harmless) engines"' report.json
+              jq -r '.data.attributes.last_analysis_results | to_entries[] | select(.value.category=="malicious" or .value.category=="suspicious") | "- \(.key): \(.value.result)"' report.json
+              echo "[Full VirusTotal report](https://www.virustotal.com/gui/file/$sha)"
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
