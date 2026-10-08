@@ -142,7 +142,7 @@ npm test        # unit tests (ssh_config, known_hosts, remote commands, alert ho
 npm run dist    # build dist/Nexus-Setup-<version>.exe
 ```
 
-CI runs the tests on Windows, macOS and Linux on every push. To publish a release, bump `version` in `package.json`, then push a matching tag (`git tag v1.3.0 && git push --tags`). The Release workflow builds the Windows, macOS and Linux installers into a **draft** release, scans them all with ClamAV ([hugoalh/scan-virus-ghaction](https://github.com/hugoalh/scan-virus-ghaction)), and publishes the release only if nothing is found, with the scan result and SHA-256 checksums in its notes. Installed copies update from it.
+CI runs the tests on Windows, macOS and Linux on every push. To publish a release, bump `version` in `package.json`, then push a matching tag (`git tag v1.3.0 && git push --tags`). The Release workflow builds the Windows, macOS and Linux installers into a **draft** release, then `verify-and-publish.yml` scans them: **VirusTotal** (~70 engines, every installer) and **Microsoft Defender** (Windows installer) must both be clean, and ClamAV ([hugoalh/scan-virus-ghaction](https://github.com/hugoalh/scan-virus-ghaction)) runs as a reported check. Only then is the release published, with the VirusTotal reports, the scan log and SHA-256 checksums in its notes. (The ClamAV bundled in that action, 1.0.3 with 2023 signatures, flags the official Electron runtime itself as `Win.Trojan.Virut`, so it can't gate an Electron app.) The workflow needs a `VT_API_KEY` repository secret. Installed copies update from it.
 
 ## Credits
 

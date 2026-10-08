@@ -1,7 +1,8 @@
 name: Release
 
 # Push a tag like v1.3.0 (matching package.json "version") to build installers for Windows, macOS and Linux.
-# They are uploaded to a draft release, virus-scanned, and the release is published only if the scan is clean.
+# They are uploaded to a draft release, scanned (VirusTotal + Microsoft Defender block; ClamAV is reported), and the
+# release is published only if the blocking scans are clean.
 # Installed copies of Nexus then pick it up automatically.
 on:
   push:
@@ -51,50 +52,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
 
-  # Scan every uploaded installer with ClamAV (signatures updated at scan time) and publish only if all are clean.
-  scan:
+  # VirusTotal + Microsoft Defender gate (blocking) and ClamAV (reported), then publish: see verify-and-publish.yml.
+  verify:
     needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download installers from the draft release
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/release"
-          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir "$GITHUB_WORKSPACE/release" \
-            --pattern '*.exe' --pattern '*.dmg' --pattern '*.zip' --pattern '*.AppImage' --pattern '*.deb'
-          ls -la "$GITHUB_WORKSPACE/release"
-          (cd "$GITHUB_WORKSPACE/release" && sha256sum * > "$GITHUB_WORKSPACE/SHA256SUMS.txt")
-          cat "$GITHUB_WORKSPACE/SHA256SUMS.txt"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Scan Virus
-        id: scan
-        uses: hugoalh/scan-virus-ghaction@v0.20.1
-        with:
-          clamav_enable: 'True'
-          clamav_update: 'True'
-          found_summary: 'True'
-          statistics_summary: 'True'
-      - name: Publish release with scan result
-        if: steps.scan.outcome == 'success' && steps.scan.outputs.found != 'True' && steps.scan.outputs.found != 'true'
-        run: |
-          n=$(ls release | wc -l)
-          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json body --jq .body > notes.md
-          {
-            echo
-            echo "### Virus scan: clean"
-            echo "All $n installers were scanned with ClamAV (signatures updated at scan time) by [hugoalh/scan-virus-ghaction](https://github.com/hugoalh/scan-virus-ghaction) before this release was published: no threats found. [Scan log]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
-            echo
-            echo "SHA-256 checksums (also attached as SHA256SUMS.txt):"
-            echo '```'
-            cat SHA256SUMS.txt
-            echo '```'
-          } >> notes.md
-          gh release upload "$GITHUB_REF_NAME" SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
-          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes-file notes.md --draft=false --latest
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Keep the release as a draft if anything was found
-        if: always() && (steps.scan.outcome != 'success' || steps.scan.outputs.found == 'True' || steps.scan.outputs.found == 'true')
-        run: |
-          echo "::error::Virus scan did not come back clean (finish=${{ steps.scan.outputs.finish }}, found=${{ steps.scan.outputs.found }}). The release stays a draft; check the scan step."
-          exit 1
+    uses: ./.github/workflows/verify-and-publish.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit

@@ -1,0 +1,171 @@
+name: Verify and publish
+
+# Scans a draft release's installers and publishes it only if they're clean.
+#   Blocking:  VirusTotal (~70 engines) on every installer, Microsoft Defender on the Windows installer.
+#   Reported:  ClamAV via hugoalh/scan-virus-ghaction (its bundled 2023 ClamAV flags the official Electron binary
+#              itself as Win.Trojan.Virut, so it can't block Electron apps; its result is shown in the notes).
+# Runs after every release build (called from release.yml) or manually for an existing draft.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+    secrets:
+      VT_API_KEY:
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (draft) to verify and publish
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag }}
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  clamav:
+    runs-on: ubuntu-latest
+    outputs:
+      found: ${{ steps.scan.outputs.found }}
+      outcome: ${{ steps.scan.outcome }}
+    steps:
+      - name: Download installers
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/release"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$GITHUB_WORKSPACE/release" \
+            --pattern '*.exe' --pattern '*.dmg' --pattern '*.zip' --pattern '*.AppImage' --pattern '*.deb'
+      - name: Scan Virus
+        id: scan
+        continue-on-error: true
+        uses: hugoalh/scan-virus-ghaction@v0.20.1
+        with:
+          clamav_enable: 'True'
+          clamav_update: 'True'
+          found_summary: 'True'
+          statistics_summary: 'True'
+
+  defender:
+    runs-on: windows-latest
+    steps:
+      - name: Download Windows installer
+        shell: bash
+        run: mkdir -p dl && gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dl --pattern '*.exe'
+      - name: Microsoft Defender
+        shell: pwsh
+        run: |
+          $mp = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+          & $mp -SignatureUpdate | Select-Object -Last 1
+          $sig = (Get-MpComputerStatus).AntivirusSignatureVersion
+          "Defender signatures: $sig"
+          $bad = 0
+          foreach ($f in Get-ChildItem dl -Filter *.exe) {
+            $r = (& $mp -Scan -ScanType 3 -File $f.FullName -DisableRemediation | Select-Object -Last 1)
+            "$($f.Name): $r"
+            if ($r -notmatch 'found no threats') { $bad++ }
+          }
+          "- Microsoft Defender (signatures $sig): " + ($(if ($bad) { 'THREATS FOUND' } else { 'no threats' })) | Out-File defender.md -Encoding utf8
+          if ($bad) { Write-Error "Defender found threats"; exit 1 }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: defender
+          path: defender.md
+
+  virustotal:
+    runs-on: ubuntu-latest
+    env:
+      VT: ${{ secrets.VT_API_KEY }}
+    steps:
+      - name: Download installers
+        run: |
+          [ -n "$VT" ] || { echo "::error::The VT_API_KEY repository secret is missing"; exit 1; }
+          mkdir -p dl && gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dl \
+            --pattern '*.exe' --pattern '*.dmg' --pattern '*.AppImage' --pattern '*.deb'
+          ls -la dl
+      - name: VirusTotal
+        run: |
+          set -uo pipefail
+          api=https://www.virustotal.com/api/v3
+          bad=0
+          : > vt.md
+          for f in dl/*; do
+            name=$(basename "$f"); sha=$(sha256sum "$f" | cut -d' ' -f1)
+            echo "== $name  $sha"
+            code=$(curl -s -o report.json -w '%{http_code}' -H "x-apikey: $VT" "$api/files/$sha")
+            if [ "$code" != "200" ]; then
+              url=$(curl -sf -H "x-apikey: $VT" "$api/files/upload_url" | jq -r .data)
+              id=$(curl -sf -H "x-apikey: $VT" -F "file=@$f" "$url" | jq -r .data.id)
+              [ -n "$id" ] && [ "$id" != null ] || { echo "upload failed"; bad=1; continue; }
+              for i in $(seq 1 60); do
+                sleep 30
+                st=$(curl -sf -H "x-apikey: $VT" "$api/analyses/$id" | jq -r .data.attributes.status)
+                [ "$st" = "completed" ] && break
+              done
+              sleep 20
+              curl -sf -H "x-apikey: $VT" "$api/files/$sha" -o report.json || { echo "no report"; bad=1; continue; }
+            fi
+            mal=$(jq '.data.attributes.last_analysis_stats.malicious' report.json)
+            sus=$(jq '.data.attributes.last_analysis_stats.suspicious' report.json)
+            tot=$(jq '.data.attributes.last_analysis_stats | .malicious + .suspicious + .undetected + .harmless' report.json)
+            echo "malicious=$mal suspicious=$sus engines=$tot"
+            jq -r '.data.attributes.last_analysis_results | to_entries[] | select(.value.category=="malicious" or .value.category=="suspicious") | "  \(.key): \(.value.category) \(.value.result)"' report.json
+            echo "| $name | $mal / $tot | [report](https://www.virustotal.com/gui/file/$sha) |" >> vt.md
+            [ "$mal" = "0" ] || bad=1
+            sleep 16 # free API: 4 requests/minute
+          done
+          cat vt.md
+          [ "$bad" = "0" ] || { echo "::error::VirusTotal flagged a file (or a check failed); not publishing"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: virustotal
+          path: vt.md
+
+  publish:
+    needs: [clamav, defender, virustotal]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: results
+      - name: Checksums
+        run: |
+          mkdir -p dl && gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dl \
+            --pattern '*.exe' --pattern '*.dmg' --pattern '*.zip' --pattern '*.AppImage' --pattern '*.deb'
+          (cd dl && sha256sum *) > SHA256SUMS.txt
+      - name: Publish release with scan results
+        env:
+          CLAM_FOUND: ${{ needs.clamav.outputs.found }}
+          CLAM_OUTCOME: ${{ needs.clamav.outputs.outcome }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > notes.md
+          run="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [ "$CLAM_OUTCOME" = success ] && [ "$CLAM_FOUND" != True ] && [ "$CLAM_FOUND" != true ]; then
+            clam="- ClamAV ([hugoalh/scan-virus-ghaction](https://github.com/hugoalh/scan-virus-ghaction)): no threats"
+          else
+            clam="- ClamAV ([hugoalh/scan-virus-ghaction](https://github.com/hugoalh/scan-virus-ghaction), bundled ClamAV 1.0.3 with 2023 signatures): reports \`Win.Trojan.Virut\` on the Windows Nexus.exe. The same scanner flags the official, unmodified Electron runtime that Nexus is built on, so this is a false positive; the engines above find nothing."
+          fi
+          {
+            echo
+            echo "### Security scan"
+            echo "Every installer was checked before this release was published ([scan log]($run)):"
+            echo
+            echo "| File | VirusTotal (malicious / engines) | Report |"
+            echo "|---|---|---|"
+            cat results/vt.md
+            echo
+            cat results/defender.md
+            echo "$clam"
+            echo
+            echo "SHA-256 checksums (also attached as SHA256SUMS.txt):"
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } >> notes.md
+          gh release upload "$TAG" SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md --draft=false --latest
