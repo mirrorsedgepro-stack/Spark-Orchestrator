@@ -77,7 +77,7 @@ jobs:
           if (-not (Test-Path $mp)) { Write-Host "Defender is not available on this runner"; exit 0 }
           & $mp -SignatureUpdate | Select-Object -Last 1
           (Get-MpComputerStatus).AntivirusSignatureVersion
-          foreach ($f in (Get-ChildItem dl/*.exe) + (Get-Item x/app/Nexus.exe)) {
+          foreach ($f in @(Get-ChildItem dl/*.exe) + @(Get-Item x/app/Nexus.exe)) {
             Write-Host "== $($f.Name)"
             & $mp -Scan -ScanType 3 -File $f.FullName -DisableRemediation | Select-Object -Last 2
           }
