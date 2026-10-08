@@ -7,6 +7,7 @@ const config = require('./lib/config');
 const local = require('./lib/local');
 const { Machine } = require('./lib/remote');
 const tailscale = require('./lib/tailscale');
+const collab = require('./lib/collab');
 
 if (!app.requestSingleInstanceLock()) app.quit();
 app.setAppUserModelId('com.nexus.terminal');
@@ -63,7 +64,10 @@ function getMachine(id) {
       remember: (k, fp) => { const c = config.load(); c.knownHosts[k] = fp; config.save(c); },
       askPassphrase,
     });
-    m.on('status', (status, error, route) => send('machine:status', id, status, error, route));
+    m.on('status', (status, error, route) => {
+      send('machine:status', id, status, error, route);
+      if (status === 'online' && hub && hub.machineId === id && !hub.ch.stream) startHub(id).catch(() => {});
+    });
     machines.set(id, m);
   }
   return machines.get(id);
@@ -316,6 +320,36 @@ ipcMain.handle('ts:revoke', safe(async (_e, { userId, inviteId }) => {
 ipcMain.handle('ts:encode-invite', (_e, data) => tailscale.encodeInvite(data));
 ipcMain.handle('ts:decode-invite', safe(async (_e, code) => tailscale.decodeInvite(code)));
 
+// ---- IPC: team chat + presence (stored on the hub Spark, over the existing SSH connection) ----
+let hub = null; // { machineId, ch: CollabHub }
+function stopHub() {
+  if (hub) { hub.ch.removeAllListeners(); hub.ch.stop(); }
+  hub = null;
+}
+async function startHub(machineId) {
+  stopHub();
+  const mach = getMachine(machineId);
+  const ch = new collab.CollabHub(mach);
+  hub = { machineId, ch };
+  ch.on('message', (m) => send('collab:message', m));
+  ch.on('closed', () => send('collab:state', { machineId, live: false }));
+  await ch.start();
+  send('collab:state', { machineId, live: true });
+}
+ipcMain.handle('collab:start', safe(async (_e, machineId) => { await startHub(machineId); }));
+ipcMain.handle('collab:stop', () => { stopHub(); return true; });
+ipcMain.handle('collab:post', safe(async (_e, { from, text, kind }) => {
+  if (!hub) throw new Error('Team chat is not connected');
+  const m = collab.makeMessage({ from, text, kind });
+  if (!m.text) throw new Error('Empty message');
+  await hub.ch.post(m);
+  return { id: m.id };
+}));
+ipcMain.handle('collab:heartbeat', safe(async (_e, presence) => {
+  if (!hub) return { presence: [] };
+  return { presence: await hub.ch.heartbeat(collab.makePresence(presence)) };
+}));
+
 // ---- IPC: sessions ----
 ipcMain.handle('session:create', async (_e, spec) => {
   const cfg = config.load();
@@ -357,7 +391,7 @@ ipcMain.handle('session:create', async (_e, spec) => {
 
     const mach = getMachine(m.id);
     const tmuxName = spec.raw ? null : (spec.attach || `nx-${preset.id}-${Date.now().toString(36).slice(-4)}${Math.random().toString(36).slice(2, 4)}`);
-    const stream = await mach.open({ tmuxName, cmd, cols, rows, cwd: spec.attach ? '' : spec.cwd });
+    const stream = await mach.open({ tmuxName, cmd, cols, rows, cwd: spec.cwd, readOnly: !!spec.readOnly });
     const dec = new StringDecoder('utf8');
     let exitCode = null;
     sessions.set(id, {

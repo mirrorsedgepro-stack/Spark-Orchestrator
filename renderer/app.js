@@ -144,7 +144,8 @@
       name: extra.name || (extra.cwd && extra.cwd !== '~' ? `${p.name} · ${baseName(extra.cwd)}` : same ? `${p.name} ${same + 1}` : p.name),
       tmuxName: extra.attach || null,
       cwd: extra.cwd || null,
-      spec: { raw: extra.raw, cmd: extra.cmd, script: extra.script, scriptMachine: extra.scriptMachine },
+      spec: { raw: extra.raw, cmd: extra.cmd, script: extra.script, scriptMachine: extra.scriptMachine, readOnly: extra.readOnly },
+      readOnly: !!extra.readOnly, announce: !!extra.announce,
       pid: null, status: 'starting', activity: 'idle', title: '',
       lastData: 0, lastInput: 0, burst: 0, quietUntil: 0, busySince: 0,
       promptLine: null, retry: 0, retryTimer: null,
@@ -161,6 +162,7 @@
       s.lastInput = now();
       // Remember where the user's last submitted prompt was, for "Send last reply".
       if (d === '\r') { const b = term.buffer.active; s.promptLine = b.baseY + b.cursorY; }
+      if (s.readOnly) return; // watching someone else's session: tmux ignores input anyway
       if (s.status === 'running') api.write(s.pid, d);
       else if (s.status === 'starting') s.pendingInput = (s.pendingInput || '') + d; // sent once connected
       else if ((s.status === 'exited' || s.status === 'disconnected') && d === '\r') { clearTimeout(s.retryTimer); start(s); }
@@ -258,6 +260,7 @@
       return;
     }
     if (s.retry) s.term.write('\x1b[38;2;115;218;202m✓ Reconnected\x1b[0m\r\n');
+    if (s.announce) { s.announce = false; setTimeout(() => announceLaunch(s), 0); }
     s.retry = 0;
     s.pid = r.id;
     if (r.tmuxName) s.tmuxName = r.tmuxName;
@@ -274,7 +277,8 @@
     const m = machineById(machineId);
     if (m.type === 'ssh' && !m.host) { openSettings(); toast(`Add the address of ${m.name} first.`); return null; }
     if (isMissing(m, presetById(presetId)) && !extra.raw && !extra.script) toast(installHint(m, presetId), 'warn');
-    const s = makeSession(machineId, presetId, extra);
+    if (!extra.raw && !extra.script && !extra.attach && !(await checkFolderConflict(machineId, presetId, extra.cwd))) return null;
+    const s = makeSession(machineId, presetId, { announce: !extra.raw && !extra.script && !extra.attach, ...extra });
     show(s.id);
     await frame();
     try { s.fit.fit(); } catch {}
@@ -282,11 +286,21 @@
     return s;
   }
 
-  function reattach(machineId, name, { focus = true, cwd, label } = {}) {
-    const existing = ordered().find((s) => s.machineId === machineId && s.tmuxName === name);
+  async function reattach(machineId, name, { focus = true, cwd, label, auto = false } = {}) {
+    const existing = ordered().find((s) => s.machineId === machineId && s.tmuxName === name && !s.readOnly);
     if (existing) return show(existing.id);
+    let readOnly = false;
+    if (!auto) {
+      const v = await checkSessionConflict(machineId, name);
+      if (!v) return;
+      readOnly = v === 'watch';
+    }
     const d = ((S.mstate[machineId] || {}).detached || []).find((x) => x.name === name);
-    const s = makeSession(machineId, presetFromTmux(name), { attach: name, cwd: cwd || (d && d.cwd) || undefined, name: label });
+    const p = presetById(presetFromTmux(name));
+    const s = makeSession(machineId, presetFromTmux(name), {
+      attach: name, cwd: cwd || (d && d.cwd) || undefined, readOnly,
+      name: readOnly ? `${p.name} (watching)` : label,
+    });
     if (focus || !S.panes.some(Boolean)) show(s.id, { focus });
     else renderAll();
     frame().then(() => { try { if (isVisible(s)) s.fit.fit(); } catch {} start(s); });
@@ -645,6 +659,7 @@
       head.innerHTML = `${glyph(s.presetId, 'sm', s.machineId)}<span class="p-title">${esc(s.name)}</span>`
         + `<span class="chip" style="--mc:${m.color}">${esc(m.name)}</span>`
         + (s.cwd ? `<span class="chip ghost" title="${esc(s.cwd)}">${I.folder}${esc(shortPath(s.cwd))}</span>` : '')
+        + (s.readOnly ? '<span class="chip" style="--mc:#bb9af7">read-only</span>' : '')
         + stateChip
         + `<span class="p-sub" title="${esc(s.tmuxName ? `tmux session ${s.tmuxName}` : '')}">${esc(s.title)}</span>`
         + (isAgent(s) ? `<button class="icon-btn" data-pact="reply" title="Send last reply to another agent (Ctrl+Shift+S)">${I.send}</button>` : '')
@@ -706,11 +721,13 @@
       const i = S.order.indexOf(s.id);
       return `<div class="s-item ${f === s ? 'active' : ''}" style="--c:${s.color}" data-act="show" data-s="${s.id}">${glyph(s.presetId, 'sm', s.machineId)}`
         + `<span class="s-title">${esc(s.name)}${s.title ? `<span style="color:var(--text-3)"> · ${esc(s.title)}</span>` : ''}</span>`
+        + othersOnSession(s.machineId, s.tmuxName)
         + `<span class="act ${actClass(s)}"></span>${i < 9 ? `<span class="s-num">^${i + 1}</span>` : ''}`
         + `<button class="s-x" data-act="close" data-s="${s.id}" title="${s.tmuxName ? 'Detach' : 'Close'}">${I.x}</button></div>`;
     }).join('');
     const det = detached.map((d) => `<div class="s-item detached" style="--c:${presetById(presetFromTmux(d.name)).color}" data-act="reattach" data-m="${m.id}" data-name="${esc(d.name)}" title="Reattach">`
       + `${glyph(presetFromTmux(d.name), 'sm', m.id)}<span class="s-title">${esc(d.name)}${d.cwd ? `<span style="color:var(--text-3)"> · ${esc(shortPath(d.cwd))}</span>` : ''}</span>`
+      + othersOnSession(m.id, d.name)
       + `<button class="s-x" data-act="kill" data-m="${m.id}" data-name="${esc(d.name)}" title="Kill this tmux session">${I.x}</button></div>`).join('');
 
     return `<div class="machine" style="--c:${m.color}" data-machine="${m.id}">
@@ -1000,13 +1017,15 @@
     st.tools = r.tools;
     st.hostname = r.hostname;
     st.home = r.home;
+    st.user = r.user;
+    setTimeout(ensureHub, 0);
     st.detached = r.sessions.filter((x) => x.name.startsWith('nx-')).sort((a, b) => b.activity - a.activity);
     if (!S.autoReattached[id]) {
       S.autoReattached[id] = true;
       const open = new Set(ordered().map((s) => s.tmuxName));
       const resumable = S.cfg.appearance.restoreSession === false ? [] : st.detached.filter((x) => !x.attached && !open.has(x.name)).slice(0, 8);
       if (resumable.length) {
-        resumable.forEach((d, i) => reattach(id, d.name, { focus: i === 0 && !focused() }));
+        resumable.forEach((d, i) => reattach(id, d.name, { focus: i === 0 && !focused(), auto: true }));
         toast(`Resumed ${resumable.length} running session${resumable.length > 1 ? 's' : ''} on ${m.name}`, 'ok');
       }
     }
@@ -1131,6 +1150,7 @@
     if (c && sh && k === 'd') { const s = focused(); if (s) splitWith(s); return true; }
     if (c && sh && k === 's') { const s = focused(); if (s) sendLastReply(s); return true; }
     if (c && sh && k === 'o') { openWorkspaces(); return true; }
+    if (c && sh && k === 'm') { toggleTeam(); return true; }
     if (c && sh && k === 'n') { openPalette('in folder '); return true; }
     if (c && !sh && !a && /^[1-9]$/.test(k)) { const s = ordered()[Number(k) - 1]; if (s) show(s.id); return true; }
     if (c && k === 'Tab') { cycle(sh ? -1 : 1); return true; }
@@ -1306,6 +1326,7 @@
     cmd('Broadcast prompt to sessions', () => openComposer(), 'Ctrl+Shift+Enter', I.send);
     cmd('Workspaces…', openWorkspaces, 'Ctrl+Shift+O', I.layout);
     cmd('Share the Sparks over Tailscale…', openShare, '', I.send);
+    cmd('Team chat', () => openTeam(), 'Ctrl+Shift+M', I.send);
     cmd('Save layout as workspace…', saveWorkspace, '', I.save);
     if (focused()) cmd(`Send last reply from ${focused().name} to…`, () => sendLastReply(focused()), 'Ctrl+Shift+S', I.send);
     cmd('Settings', openSettings, 'Ctrl+,', I.gear);
@@ -1508,6 +1529,9 @@
         <div class="field c4"><label>Font family</label><input class="mono" data-a="fontFamily" value="${esc(a.fontFamily)}"></div>
         <label class="check field c3" style="flex-direction:row"><input type="checkbox" data-a="copyOnSelect" ${a.copyOnSelect ? 'checked' : ''}><span>Copy on select</span></label>
         <label class="check field c3" style="flex-direction:row"><input type="checkbox" data-a="notifyWhenDone" ${a.notifyWhenDone ? 'checked' : ''}><span>Notify when a background agent finishes</span></label>
+        <div class="field c3"><label>Your name in team chat</label><input data-c="name" value="${esc((d.collab || {}).name || '')}" placeholder="${esc((S.tsUser && S.tsUser.name) || 'from Tailscale')}"></div>
+        <div class="field c3"><label>Team chat lives on</label><select data-c="hub"><option value="">Auto (first Spark by hostname)</option>${d.machines.filter((m) => m.type === 'ssh').map((m) => { const h = (S.mstate[m.id] || {}).hostname; return h ? `<option value="${esc(h)}" ${(d.collab || {}).hub === h ? 'selected' : ''}>${esc(m.name)} (${esc(h)})</option>` : ''; }).join('')}</select></div>
+        <label class="check field c6" style="flex-direction:row"><input type="checkbox" data-c="announce" ${(d.collab || {}).announce !== false ? 'checked' : ''}><span>Post in team chat when I start an agent on a shared Spark</span></label>
         <label class="check field c6" style="flex-direction:row"><input type="checkbox" data-a="restoreSession" ${a.restoreSession !== false ? 'checked' : ''}><span>Restore sessions, layout and folders when Nexus starts</span></label>
       </div>`;
   }
@@ -1525,6 +1549,8 @@
   async function saveSettings() {
     S.cfg = await api.saveConfig(S.draft);
     S.draft = JSON.parse(JSON.stringify(S.cfg));
+    TM.live = false; // re-pick the chat hub with the new settings
+    ensureHub();
     applyAppearance();
     renderAll();
     for (const m of S.cfg.machines) {
@@ -1539,6 +1565,10 @@
       const m = S.draft.machines[Number(form.dataset.mi)];
       m[t.dataset.f] = t.dataset.f === 'port' ? Number(t.value) || 22 : t.value.trim();
       if (t.dataset.f === 'color') form.style.setProperty('--c', t.value);
+    }
+    if (t.dataset.c) {
+      const c = (S.draft.collab = S.draft.collab || {});
+      c[t.dataset.c] = t.type === 'checkbox' ? t.checked : t.value.trim();
     }
     if (t.dataset.a) {
       const a = S.draft.appearance;
@@ -1819,6 +1849,214 @@
     });
   }
 
+  // ---------------------------------------------------------------- team chat + presence
+  // Chat and presence live on one "hub" Spark (~/.nexus/collab). Everyone's Nexus reads/writes them over its own
+  // SSH connection; presence (who has which session open) drives the "someone's already in there" warnings.
+  const TM = { hubId: null, live: false, messages: [], seen: new Set(), presence: [], unread: 0, open: false, status: '', starting: false };
+  const collabCfg = () => (S.cfg.collab = S.cfg.collab || {});
+  const myClient = () => collabCfg().client;
+  const myName = () => collabCfg().name || (S.tsUser && S.tsUser.name) || 'Me';
+  const me = () => ({ name: myName(), login: (S.tsUser && S.tsUser.login) || '', client: myClient() });
+  const hostOf = (machineId) => (S.mstate[machineId] || {}).hostname || '';
+  const userOf = (machineId) => (S.mstate[machineId] || {}).user || machineById(machineId).user || '';
+  const hueOf = (s) => { let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) % 360; return h; };
+  const avatar = (name, cls = '') => `<span class="ava ${cls}" style="--h:${hueOf(name)}" title="${esc(name)}">${esc(String(name).trim().slice(0, 1).toUpperCase() || '?')}</span>`;
+  const others = () => TM.presence.filter((p) => p.client !== myClient());
+
+  async function initTeam() {
+    if (!collabCfg().client) {
+      collabCfg().client = Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, '0')).join('');
+      api.patchConfig({ collab: S.cfg.collab });
+    }
+    api.tsStatus().then((t) => { S.tsUser = t && t.local && t.local.user; renderTeam(); }).catch(() => {});
+    setInterval(heartbeat, 15000);
+  }
+
+  // The hub: Settings override (by hostname), else the online Spark whose hostname sorts first, so everyone
+  // connected to the same Sparks lands on the same chat without configuring anything.
+  function pickHub() {
+    const online = S.cfg.machines.filter((m) => m.type === 'ssh' && (S.mstate[m.id] || {}).status === 'online' && hostOf(m.id));
+    const want = collabCfg().hub;
+    if (want) return online.find((m) => hostOf(m.id) === want) || null;
+    return online.sort((a, b) => hostOf(a.id).localeCompare(hostOf(b.id)))[0] || null;
+  }
+  async function ensureHub() {
+    const m = pickHub();
+    if (!m || TM.starting || (TM.hubId === m.id && TM.live)) return;
+    TM.starting = true;
+    const r = await api.collabStart(m.id);
+    TM.starting = false;
+    if (r.ok) { TM.hubId = m.id; TM.live = true; heartbeat(); }
+    renderTeam();
+  }
+  api.onCollabState(({ machineId, live }) => { if (machineId === TM.hubId) { TM.live = live; renderTeam(); } });
+
+  function mySessions() {
+    return ordered().filter((s) => s.tmuxName && s.status === 'running' && machineById(s.machineId).type === 'ssh').map((s) => ({
+      host: hostOf(s.machineId), user: userOf(s.machineId), tmux: s.tmuxName, preset: s.presetId, name: s.name, cwd: s.cwd || '',
+    }));
+  }
+  async function heartbeat() {
+    if (!TM.live) { ensureHub(); return; }
+    const r = await api.collabHeartbeat({ ...me(), status: TM.status, sessions: mySessions() });
+    if (r.ok) { TM.presence = r.presence; renderTeam(); renderChrome(); }
+  }
+
+  api.onCollabMessage((m) => {
+    if (TM.seen.has(m.id)) return;
+    TM.seen.add(m.id);
+    TM.messages.push(m);
+    if (TM.messages.length > 500) TM.messages.splice(0, TM.messages.length - 500);
+    const mine = m.from.client === myClient();
+    const fresh = Date.now() - m.ts < 60000;
+    if (!mine && fresh && m.kind !== 'activity') {
+      if (!TM.open) TM.unread++;
+      const first = myName().split(/\s+/)[0].toLowerCase();
+      if (first && new RegExp(`@${first.replace(/[.*+?^${}()|[\]\\]/g, '\\  // ---------------------------------------------------------------- toasts')}\\b`, 'i').test(m.text)) {
+        api.notify({ title: `${m.from.name} mentioned you`, body: m.text.slice(0, 200) });
+        api.flash();
+      }
+    }
+    renderTeam(true);
+  });
+
+  async function postTeam(text, kind = 'msg') {
+    const r = await api.collabPost({ from: me(), text, kind });
+    if (!r.ok) toast(r.error, 'bad');
+    return r.ok;
+  }
+  // Tell the team when an agent starts on a shared Spark (so nobody opens a second one in the same folder).
+  function announceLaunch(s) {
+    if (collabCfg().announce === false || !TM.live || !isAgent(s) || machineById(s.machineId).type !== 'ssh') return;
+    postTeam(`started ${presetById(s.presetId).name} in ${s.cwd || '~'} on ${hostOf(s.machineId)}`, 'activity');
+  }
+
+  // ---- conflict checks ----
+  function whoIn(machineId, tmux) {
+    return others().filter((p) => p.sessions.some((x) => x.host === hostOf(machineId) && x.user === userOf(machineId) && x.tmux === tmux)).map((p) => p.name);
+  }
+  function whoInFolder(machineId, cwd) {
+    const norm = (d) => String(d || '').replace(/\/+$/, '') || '~';
+    return others().flatMap((p) => p.sessions
+      .filter((x) => x.host === hostOf(machineId) && x.user === userOf(machineId) && isAgent({ presetId: x.preset }) && norm(x.cwd) === norm(cwd))
+      .map((x) => ({ person: p.name, preset: presetById(x.preset).name })));
+  }
+  function choose({ title, desc, options }) {
+    return new Promise((resolve) => {
+      const ov = document.createElement('div');
+      ov.className = 'overlay';
+      ov.innerHTML = `<div class="modal prompt"><div class="modal-head"><h2>${esc(title)}</h2></div><div class="modal-body"><p class="prompt-desc" style="word-break:normal">${esc(desc)}</p></div>
+        <div class="modal-foot"><span class="spacer"></span>${options.map((o, i) => `<button class="btn ${o.primary ? 'primary' : o.ghost ? 'ghost' : ''}" data-i="${i}">${esc(o.label)}</button>`).join('')}</div></div>`;
+      document.body.appendChild(ov);
+      const done = (v) => { ov.remove(); document.removeEventListener('keydown', esc_, true); resolve(v); };
+      const esc_ = (e) => { if (e.key === 'Escape') { e.stopPropagation(); e.preventDefault(); done(null); } };
+      document.addEventListener('keydown', esc_, true);
+      ov.addEventListener('click', (e) => { const b = e.target.closest('[data-i]'); if (b) done(options[Number(b.dataset.i)].value); else if (e.target === ov) done(null); });
+      ov.querySelector('.btn.primary')?.focus();
+    });
+  }
+  // Before attaching to a session someone else is in. Returns 'open' | 'watch' | null (cancel).
+  async function checkSessionConflict(machineId, tmux) {
+    const people = whoIn(machineId, tmux);
+    if (!people.length) return 'open';
+    return choose({
+      title: `${people.join(', ')} ${people.length > 1 ? 'are' : 'is'} in this session`,
+      desc: `${tmux} on ${machineById(machineId).name} is open in ${people.join(' and ')}'s Nexus. If you both type, your keystrokes mix into the same prompt. Watch it read-only, or open it anyway (say so in team chat).`,
+      options: [{ label: 'Cancel', value: null, ghost: true }, { label: 'Open anyway', value: 'open' }, { label: 'Watch read-only', value: 'watch', primary: true }],
+    });
+  }
+  // Before starting an agent where someone else's agent already works. Returns true to go ahead.
+  async function checkFolderConflict(machineId, presetId, cwd) {
+    if (!isAgent({ presetId }) || machineById(machineId).type !== 'ssh') return true;
+    const hits = whoInFolder(machineId, cwd || '~');
+    if (!hits.length) return true;
+    const who = hits.map((h) => `${h.person} (${h.preset})`).join(', ');
+    const v = await choose({
+      title: 'Someone is already working there',
+      desc: `${who} ${hits.length > 1 ? 'are' : 'is'} running an agent in ${cwd || '~'} on ${machineById(machineId).name}. Two agents editing the same files can overwrite each other's changes.`,
+      options: [{ label: 'Cancel', value: null, ghost: true }, { label: `Message ${hits[0].person}`, value: 'msg' }, { label: 'Start anyway', value: 'go', primary: true }],
+    });
+    if (v === 'msg') { openTeam(`@${hits[0].person.split(/\s+/)[0]} `); return false; }
+    return v === 'go';
+  }
+
+  // ---- chat drawer ----
+  function openTeam(prefill) {
+    TM.open = true;
+    TM.unread = 0;
+    document.body.classList.add('team-open');
+    $('#team').hidden = false;
+    renderTeam(true);
+    const input = $('#team-input');
+    if (typeof prefill === 'string') { input.value = prefill; }
+    input.focus();
+    scheduleFit();
+    ensureHub();
+  }
+  function closeTeam() {
+    TM.open = false;
+    document.body.classList.remove('team-open');
+    $('#team').hidden = true;
+    renderTeam();
+    scheduleFit();
+    focused()?.term.focus();
+  }
+  const toggleTeam = () => (TM.open ? closeTeam() : openTeam());
+
+  const fmtTime = (ts) => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const linkify = (t) => esc(t).replace(/https?:\/\/[^\s<]+/g, (u) => `<a href="${u}" target="_blank">${u}</a>`)
+    .replace(/(^|\s)(@[\w.-]+)/g, '$1<b class="mention">$2</b>');
+
+  function renderTeam(scroll = false) {
+    const badge = $('#team-badge');
+    if (badge) { badge.textContent = TM.unread > 9 ? '9+' : String(TM.unread); badge.hidden = !TM.unread; }
+    const dot = $('#btn-team');
+    if (dot) dot.classList.toggle('live', TM.live);
+    if (!TM.open) return;
+    const hub = TM.hubId ? machineById(TM.hubId) : null;
+    $('#team-hub').innerHTML = TM.live && hub ? `<span class="dot online"></span>on ${esc(hub.name)}` : '<span class="dot connecting"></span>connecting…';
+    const people = [...TM.presence].sort((a, b) => (a.client === myClient() ? -1 : b.client === myClient() ? 1 : a.name.localeCompare(b.name)));
+    $('#team-people').innerHTML = people.length ? people.map((p) => `<div class="tp">
+        ${avatar(p.name)}<div class="tp-main"><div class="tp-name">${esc(p.name)}${p.client === myClient() ? ' <span class="dim">(you)</span>' : ''}</div>
+        ${p.status ? `<div class="tp-status">${esc(p.status)}</div>` : ''}
+        ${p.sessions.map((x) => `<div class="tp-sess">${glyph(x.preset, 'sm')}<span>${esc(presetById(x.preset).name)}${x.cwd ? ` · ${esc(shortPath(x.cwd))}` : ''}</span><span class="dim">${esc(x.host)}</span></div>`).join('')}
+        </div></div>`).join('') : '<div class="dim small">Nobody else online.</div>';
+    const list = $('#team-msgs');
+    const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 40;
+    let prev = null;
+    list.innerHTML = TM.messages.map((m) => {
+      if (m.kind === 'activity') { prev = null; return `<div class="tm-act">${avatar(m.from.name, 'xs')}<b>${esc(m.from.name)}</b> ${esc(m.text)} <span class="dim">${fmtTime(m.ts)}</span></div>`; }
+      if (m.kind === 'status') { prev = null; return `<div class="tm-act">${avatar(m.from.name, 'xs')}<b>${esc(m.from.name)}</b> ${m.text ? `set status: <i>${esc(m.text)}</i>` : 'cleared their status'} <span class="dim">${fmtTime(m.ts)}</span></div>`; }
+      const cont = prev && prev.from.client === m.from.client && m.ts - prev.ts < 5 * 60000;
+      prev = m;
+      return cont ? `<div class="tm-msg cont"><div class="tm-text">${linkify(m.text)}</div></div>`
+        : `<div class="tm-msg">${avatar(m.from.name)}<div class="tm-body"><div class="tm-meta"><b>${esc(m.from.name)}</b><span class="dim">${fmtTime(m.ts)}</span></div><div class="tm-text">${linkify(m.text)}</div></div></div>`;
+    }).join('') || '<div class="tm-empty">No messages yet. Say what you\'re working on so nobody doubles up.<br><span class="dim">Tip: <b>/status Training on Spark 2 until 3pm</b> sets your status.</span></div>';
+    if (scroll || atBottom) list.scrollTop = list.scrollHeight;
+  }
+
+  async function sendTeam() {
+    const input = $('#team-input');
+    const text = input.value.trim();
+    if (!text) return;
+    if (!TM.live) { toast('Team chat is not connected yet: connect to a Spark first', 'warn'); return; }
+    const st = /^\/status\b\s*(.*)$/s.exec(text);
+    if (st) {
+      TM.status = st[1].trim();
+      collabCfg().status = TM.status;
+      api.patchConfig({ collab: S.cfg.collab });
+      if (await postTeam(TM.status, 'status')) { input.value = ''; heartbeat(); }
+      return;
+    }
+    if (await postTeam(text)) input.value = '';
+  }
+
+  // Others' presence on my sidebar items: who else is in a session / has a detached one open.
+  function othersOnSession(machineId, tmux) {
+    const names = tmux ? whoIn(machineId, tmux) : [];
+    return names.length ? `<span class="s-who" title="Also open in ${esc(names.join(', '))}'s Nexus">${names.map((n) => avatar(n, 'xs')).join('')}</span>` : '';
+  }
+
   // ---------------------------------------------------------------- toasts
   function toast(msg, kind = '', ms = 3800, action = null) {
     const el = document.createElement('div');
@@ -1876,6 +2114,13 @@
   $('#btn-palette').addEventListener('click', () => openPalette());
   $('#btn-workspaces').addEventListener('click', openWorkspaces);
   $('#btn-share').addEventListener('click', openShare);
+  $('#btn-team').addEventListener('click', toggleTeam);
+  $('#team-close').addEventListener('click', closeTeam);
+  $('#team-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendTeam(); }
+    if (e.key === 'Escape') { e.preventDefault(); closeTeam(); }
+  });
+  $('#team-send').addEventListener('click', sendTeam);
 
   api.onFocus((f) => {
     S.winFocused = f;
@@ -1900,6 +2145,8 @@
     if (S.cfg.appearance.restoreSession !== false && S.cfg.lastSession) await openLayout(S.cfg.lastSession, { resume: true });
     for (const m of S.cfg.machines) if (m.type === 'ssh' && m.host && (S.mstate[m.id] || {}).status !== 'online') connectMachine(m.id);
     api.appInfo().then((i) => { S.version = i.version; });
+    TM.status = collabCfg().status || '';
+    initTeam();
   }
   init();
 })();

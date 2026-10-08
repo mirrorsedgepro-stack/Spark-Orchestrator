@@ -53,6 +53,13 @@ contextBridge.exposeInMainWorld('nexus', {
   tsEncodeInvite: (data) => ipcRenderer.invoke('ts:encode-invite', data),
   tsDecodeInvite: (code) => ipcRenderer.invoke('ts:decode-invite', code),
 
+  collabStart: (machineId) => ipcRenderer.invoke('collab:start', machineId),
+  collabStop: () => ipcRenderer.invoke('collab:stop'),
+  collabPost: (msg) => ipcRenderer.invoke('collab:post', msg),
+  collabHeartbeat: (presence) => ipcRenderer.invoke('collab:heartbeat', presence),
+  onCollabMessage: on('collab:message'),
+  onCollabState: on('collab:state'),
+
   onData: on('session:data'),
   onExit: on('session:exit'),
   onMachineStatus: on('machine:status'),
