@@ -19,6 +19,7 @@ jobs:
   diagnose:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
       - name: Install ClamAV + 7-Zip and update signatures
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq clamav p7zip-full >/dev/null
@@ -47,3 +48,12 @@ jobs:
           clamscan -r --infected --no-summary --max-filesize=500M --max-scansize=2000M x || true
           echo "== executables inside the new installer =="
           find x/new -iname '*.exe' -o -iname '*.dll' -o -iname '*.node' | sort | head -80
+      - name: Scan the official, unmodified Electron build for comparison
+        run: |
+          v=$(node -p "require('./package.json').devDependencies.electron.replace(/^[^0-9]*/, '')" 2>/dev/null || true)
+          [ -n "$v" ] || v=44.5.1
+          echo "Electron $v"
+          curl -sfL -o electron.zip "https://github.com/electron/electron/releases/download/v$v/electron-v$v-win32-x64.zip"
+          mkdir -p electron-official && 7z x -y -bd electron.zip -oelectron-official >/dev/null
+          sha256sum electron-official/electron.exe
+          clamscan --infected --no-summary electron-official/electron.exe && echo "official electron.exe: clean" || echo "official electron.exe: FLAGGED (above)"
