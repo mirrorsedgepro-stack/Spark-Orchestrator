@@ -716,7 +716,7 @@
     return `<div class="machine" style="--c:${m.color}" data-machine="${m.id}">
       <div class="m-head">
         <div class="m-icon">${mIcon(m)}</div>
-        <div class="m-meta"><div class="m-name">${esc(m.name)} <span class="dot ${status}" title="${status}"></span></div><div class="m-sub">${esc(sub)}</div></div>
+        <div class="m-meta"><div class="m-name">${esc(m.name)} <span class="dot ${status}" title="${status}"></span></div><div class="m-sub">${st.status === 'online' && st.route === 'tailscale' ? '<span class="route ts" title="Connected through Tailscale">TS</span>' : ''}${esc(sub)}</div></div>
         <div class="m-actions">
           ${m.type === 'ssh' ? `<button class="icon-btn" data-act="refresh" data-m="${m.id}" title="${status === 'online' ? 'Refresh' : 'Connect'}">${status === 'online' ? I.refresh : I.plug}</button>` : ''}
           <button class="icon-btn" data-act="mmenu" data-m="${m.id}" title="More">${I.more}</button>
@@ -1013,11 +1013,12 @@
     renderAll();
   }
 
-  api.onMachineStatus((id, status, error) => {
+  api.onMachineStatus((id, status, error, route) => {
     const st = (S.mstate[id] = S.mstate[id] || {});
     const was = st.status;
     st.status = status;
     st.error = error;
+    if (route) st.route = route;
     if (status === 'offline') st.detached = st.detached || [];
     // A machine that was online and dropped (Wi-Fi, reboot) is retried in the background.
     if (was === 'online' && (status === 'offline' || status === 'error')) scheduleMachineRetry(id);
@@ -1051,6 +1052,8 @@
       items.push({ label: 'Set up SSH key…', icon: I.key, run: () => setupKey(m.id) });
       items.push({ label: 'Install tools (tmux, Claude, Antigravity)…', icon: I.box, run: () => bootstrap(m.id) });
       items.push({ label: 'Enable Claude alerts', icon: I.bell, run: () => enableAlerts(m.id) });
+      items.push({ label: 'Join Tailscale (sudo tailscale up --ssh)…', icon: I.plug, run: () => launch(m.id, 'shell', { raw: true, cmd: 'sudo tailscale up --ssh && tailscale status | head -5', name: `Tailscale → ${m.name}` }) });
+      items.push({ label: 'Share over Tailscale…', icon: I.send, run: openShare });
     }
     items.push('sep', { label: 'Machine settings…', icon: I.gear, run: openSettings });
     showMenu(x, y, items);
@@ -1173,6 +1176,7 @@
       if (!$('#ctxmenu').hidden) return hideMenu();
       if (!$('#palette').hidden) return closePalette();
       if (!$('#settings').hidden) return closeSettings();
+      if ($('#share') && !$('#share').hidden) return closeShare();
       if (!$('#composer').hidden) return closeComposer();
     }
     if (e.target.matches?.('input, textarea, select') && !(e.ctrlKey && e.shiftKey)) return;
@@ -1301,6 +1305,7 @@
     cmd('Layout: grid of four', () => setLayout(4));
     cmd('Broadcast prompt to sessions', () => openComposer(), 'Ctrl+Shift+Enter', I.send);
     cmd('Workspaces…', openWorkspaces, 'Ctrl+Shift+O', I.layout);
+    cmd('Share the Sparks over Tailscale…', openShare, '', I.send);
     cmd('Save layout as workspace…', saveWorkspace, '', I.save);
     if (focused()) cmd(`Send last reply from ${focused().name} to…`, () => sendLastReply(focused()), 'Ctrl+Shift+S', I.send);
     cmd('Settings', openSettings, 'Ctrl+,', I.gear);
@@ -1477,6 +1482,7 @@
         <div class="field c2"><label>User</label><input class="mono" data-f="user" value="${esc(m.user)}" placeholder="from ~/.ssh/config"></div>
         <div class="field c3"><label>Host / IP</label><input class="mono" data-f="host" value="${esc(m.host)}" placeholder="192.168.1.50 or linuxbox.local"></div>
         <div class="field c1"><label>Port</label><input class="mono" type="number" data-f="port" value="${esc(m.port || 22)}"></div>
+        <div class="field c6"><label>Tailscale address (optional; used when the LAN address can't be reached. Filled in automatically by Share)</label><input class="mono" data-f="tsHost" value="${esc(m.tsHost)}" placeholder="spark1.tail1234.ts.net"></div>
         <div class="field c6"><label>Private key (optional; default tries ~/.ssh/id_ed25519, id_ecdsa, id_rsa, then ssh-agent)</label><input class="mono" data-f="keyPath" value="${esc(m.keyPath)}" placeholder="C:\\Users\\you\\.ssh\\id_ed25519"></div>` : ''}
       </div>
       ${ssh ? `<div class="m-form-actions">
@@ -1578,6 +1584,241 @@
   $('#settings-open-file').addEventListener('click', () => api.openConfig());
   $('#btn-settings').addEventListener('click', openSettings);
 
+  // ---------------------------------------------------------------- Tailscale sharing
+  // Owner: put the Sparks on the tailnet, lock guests to SSH on them, invite people.
+  // Guest: paste an invite code to add the Sparks (reached via their Tailscale addresses).
+  const SH = { open: false, ts: null, overview: null, busy: '', result: null, plan: null, error: '' };
+  const sshMachines = () => S.cfg.machines.filter((m) => m.type === 'ssh');
+  const tsPeerFor = (m) => {
+    const hn = ((S.mstate[m.id] || {}).hostname || '').toLowerCase();
+    const peers = (SH.ts && SH.ts.local && SH.ts.local.peers) || [];
+    return peers.find((p) => hn && (p.hostName || '').toLowerCase() === hn)
+      || peers.find((p) => m.tsHost && (p.dnsName === m.tsHost || p.ips.includes(m.tsHost)));
+  };
+  const sparkArgs = () => sshMachines().map((m) => ({ machineId: m.id, hostname: (S.mstate[m.id] || {}).hostname || '' })).filter((x) => x.hostname);
+  const sshUsersFor = () => [...new Set(sshMachines().map((m) => m.user).filter(Boolean))];
+
+  async function refreshShare({ overview = true } = {}) {
+    SH.ts = await api.tsStatus();
+    // Remember each machine's tailnet address so Nexus can fall back to it away from the LAN.
+    let changed = false;
+    for (const m of sshMachines()) {
+      const p = tsPeerFor(m);
+      if (p && p.dnsName && m.tsHost !== p.dnsName) { m.tsHost = p.dnsName; changed = true; }
+    }
+    if (changed) S.cfg = await api.saveConfig(S.cfg);
+    if (overview && SH.ts.hasToken) {
+      const r = await api.tsOverview(sparkArgs());
+      SH.overview = r.ok ? r : null;
+      SH.error = r.ok ? '' : r.error;
+    }
+    renderShare();
+  }
+
+  function openShare() {
+    hideMenu();
+    let ov = $('#share');
+    if (!ov) {
+      ov = document.createElement('div');
+      ov.id = 'share';
+      ov.className = 'overlay';
+      ov.innerHTML = '<div class="modal share"><div class="modal-head"><h2>Share the Sparks</h2><button class="icon-btn" data-sh="close">' + I.x + '</button></div><div class="modal-body" id="share-body"></div></div>';
+      document.body.appendChild(ov);
+      ov.addEventListener('click', onShareClick);
+      ov.addEventListener('mousedown', (e) => { if (e.target === ov) closeShare(); });
+    }
+    ov.hidden = false;
+    SH.open = true;
+    SH.result = null;
+    SH.plan = null;
+    renderShare();
+    refreshShare();
+  }
+  function closeShare() {
+    const ov = $('#share');
+    if (ov) ov.hidden = true;
+    SH.open = false;
+    focused()?.term.focus();
+  }
+
+  const step = (n, title, body, state = '') => `<section class="sh-step ${state}"><div class="sh-num">${state === 'done' ? '✓' : n}</div><div class="sh-main"><h3>${title}</h3>${body}</div></section>`;
+
+  function renderShare() {
+    const body = $('#share-body');
+    if (!body) return;
+    const ts = SH.ts;
+    const local = ts && ts.local;
+    if (!ts) { body.innerHTML = '<p class="hint">Checking Tailscale…</p>'; return; }
+
+    // 1. This PC on the tailnet
+    let pc;
+    if (!local.installed) pc = `<p>Tailscale isn't installed on this PC.</p><button class="btn sm primary" data-sh="install">Install Tailscale</button>`;
+    else if (!local.running || local.state !== 'Running') pc = `<p>Tailscale is installed but not signed in${local.state ? ` (${esc(local.state)})` : ''}. Open the Tailscale app from the system tray and sign in, then press Refresh.</p>`;
+    else pc = `<p>Connected to <b>${esc(local.tailnet || 'your tailnet')}</b> as <span class="mono">${esc((local.self && local.self.dnsName) || '')}</span>.</p>`;
+    const pcDone = local.installed && local.state === 'Running';
+
+    // 2. Sparks on the tailnet
+    const rows = sshMachines().map((m) => {
+      const p = pcDone ? tsPeerFor(m) : null;
+      const st = S.mstate[m.id] || {};
+      const right = p
+        ? `<span class="chip" style="--mc:${p.online ? '#73daca' : '#646d85'}">${p.online ? 'online' : 'offline'}</span><span class="mono dim">${esc(p.dnsName)}</span>`
+        : st.status === 'online'
+          ? `<button class="btn sm" data-sh="join" data-m="${m.id}">Join Tailscale</button>`
+          : '<span class="dim">connect to it on the LAN first</span>';
+      return `<div class="sh-row"><span class="m-icon sm" style="--c:${m.color}">${mIcon(m)}</span><b>${esc(m.name)}</b><span class="dim">${esc(m.user || '')}</span><span class="spacer"></span>${right}</div>`;
+    }).join('');
+    const sparksDone = pcDone && sshMachines().length && sshMachines().every((m) => tsPeerFor(m));
+
+    // 3. API token
+    const token = ts.hasToken
+      ? `<p>API token saved, encrypted with your Windows account. <button class="linklike" data-sh="cleartoken">Remove</button></p>`
+      : `<p>Nexus needs a Tailscale <b>API access token</b> to send invites and set access rules. Create one at
+         <a href="https://login.tailscale.com/admin/settings/keys" target="_blank">login.tailscale.com → Settings → Keys</a> ("Generate access token…"), then paste it here.</p>
+         <div class="sh-inline"><input type="password" id="sh-token" placeholder="tskey-api-…" spellcheck="false"><button class="btn sm primary" data-sh="savetoken">Save</button></div>`;
+
+    // 4. Access rules
+    let rules = '';
+    if (ts.hasToken) {
+      if (SH.plan) {
+        rules = `<p>Nexus will make these changes to your tailnet:</p><ul class="sh-list">${SH.plan.changes.map((c) => `<li>${esc(c)}</li>`).join('') || '<li>Nothing: already set up.</li>'}</ul>`
+          + (SH.plan.missing.length ? `<p class="warn">Not on the tailnet yet: ${SH.plan.missing.map(esc).join(', ')}. Join them first (step 2).</p>` : '')
+          + `<div class="sh-inline"><button class="btn sm primary" data-sh="apply" ${SH.plan.changes.length ? '' : 'disabled'}>Apply changes</button><button class="btn sm ghost" data-sh="cancelplan">Cancel</button></div>`;
+      } else {
+        const tagged = SH.overview && SH.overview.sparks.length && SH.overview.sparks.every((s) => s.device && s.device.tags.includes(SH.overview.tag));
+        rules = `<p>Guests get SSH to the Sparks only, as ${sshUsersFor().map((u) => `<span class="mono">${esc(u)}</span>`).join(' / ')}, through Tailscale SSH: no keys to hand out, and removing a guest cuts access straight away. Your own access stays unchanged.</p>`
+          + `<div class="sh-inline"><button class="btn sm ${tagged ? '' : 'primary'}" data-sh="plan">${tagged ? 'Re-check access rules' : 'Review access rules…'}</button>${tagged ? '<span class="chip" style="--mc:#73daca">Sparks tagged and locked down</span>' : ''}</div>`;
+      }
+    }
+
+    // 5. Guests
+    let guests = '';
+    if (ts.hasToken) {
+      const list = (SH.overview && SH.overview.guests) || [];
+      guests = `<div class="sh-inline"><input type="email" id="sh-email" placeholder="friend@example.com" spellcheck="false"><button class="btn sm primary" data-sh="invite">Invite</button></div>`
+        + (SH.result ? `<div class="sh-result"><p><b>Invite ready for ${esc(SH.result.email)}</b>. Tailscale has emailed them too. Send them this message:</p>
+            <textarea readonly rows="9" id="sh-message">${esc(SH.result.message)}</textarea>
+            <div class="sh-inline"><button class="btn sm primary" data-sh="copymsg">Copy message</button><button class="btn sm" data-sh="copycode">Copy invite code only</button></div></div>` : '')
+        + (list.length ? `<div class="sh-guests">${list.map((g) => `<div class="sh-row"><b>${esc(g.email)}</b><span class="chip" style="--mc:${g.status === 'active' ? '#73daca' : '#e0af68'}">${esc(g.status)}</span><span class="spacer"></span><button class="btn sm ghost danger" data-sh="remove" data-email="${esc(g.email)}">Remove</button></div>`).join('')}</div>` : '<p class="dim">No guests yet.</p>');
+    }
+
+    body.innerHTML = `
+      <div class="sh-head"><p class="dim">Invite people to your tailnet so they can use Claude and Antigravity on the Sparks from anywhere. They can reach the Sparks over SSH and nothing else.</p><button class="btn sm ghost" data-sh="refresh">${I.refresh} Refresh</button></div>
+      ${SH.error ? `<div class="m-error">${esc(SH.error)}</div>` : ''}
+      ${step(1, 'This PC on Tailscale', pc, pcDone ? 'done' : '')}
+      ${step(2, 'Sparks on your tailnet', `<div class="sh-rows">${rows}</div><p class="dim small">"Join Tailscale" opens a terminal on that Spark running <span class="mono">sudo tailscale up --ssh</span>: type the sudo password, then open the login link it prints.</p>`, sparksDone ? 'done' : '')}
+      ${step(3, 'Tailscale API token', token, ts.hasToken ? 'done' : '')}
+      ${ts.hasToken ? step(4, 'Access rules', rules) : ''}
+      ${ts.hasToken ? step(5, 'Guests', guests) : ''}
+      <section class="sh-join"><h3>Got an invite code?</h3><p class="dim">Sign in to Tailscale with the invite link first, then paste the code to add the Sparks.</p>
+        <div class="sh-inline"><input id="sh-code" placeholder="nexus-invite:…" spellcheck="false"><button class="btn sm" data-sh="joincode">Add Sparks</button></div></section>`;
+  }
+
+  async function busy(label, fn) {
+    if (SH.busy) return;
+    SH.busy = label;
+    try { await fn(); } catch (err) { toast(err.message || String(err), 'bad', 6000); } finally { SH.busy = ''; }
+  }
+
+  // Preview + apply a policy change. Returns true when applied (or nothing to do).
+  async function applyPlan(args, { confirmText } = {}) {
+    const plan = await api.tsPlan({ machines: sparkArgs(), sshUsers: sshUsersFor(), ...args });
+    if (!plan.ok) throw new Error(plan.error);
+    if (!plan.changes.length) return true;
+    if (confirmText && !confirm(`${confirmText}\n\n• ${plan.changes.join('\n• ')}`)) return false;
+    const r = await api.tsApply(plan);
+    if (!r.ok) throw new Error(r.error);
+    return true;
+  }
+
+  async function onShareClick(e) {
+    const b = e.target.closest('[data-sh]');
+    if (!b) return;
+    const act = b.dataset.sh;
+    if (act === 'close') return closeShare();
+    if (act === 'refresh') return busy('refresh', () => refreshShare());
+    if (act === 'install') {
+      closeShare();
+      return launch('local', 'shell', { cmd: 'winget install -e --id Tailscale.Tailscale', name: 'Install Tailscale' });
+    }
+    if (act === 'join') {
+      const m = machineById(b.dataset.m);
+      closeShare();
+      return launch(m.id, 'shell', { raw: true, cmd: 'sudo tailscale up --ssh && tailscale status | head -5', name: `Tailscale → ${m.name}` });
+    }
+    if (act === 'savetoken') return busy('token', async () => {
+      const r = await api.tsSetToken($('#sh-token').value);
+      if (!r.ok) throw new Error(r.error);
+      toast(`Token saved. ${r.devices} devices on your tailnet.`, 'ok');
+      await refreshShare();
+    });
+    if (act === 'cleartoken') { await api.tsClearToken(); SH.overview = null; return refreshShare(); }
+    if (act === 'plan') return busy('plan', async () => {
+      const p = await api.tsPlan({ machines: sparkArgs(), sshUsers: sshUsersFor() });
+      if (!p.ok) throw new Error(p.error);
+      SH.plan = p;
+      renderShare();
+    });
+    if (act === 'cancelplan') { SH.plan = null; return renderShare(); }
+    if (act === 'apply') return busy('apply', async () => {
+      const r = await api.tsApply(SH.plan);
+      if (!r.ok) throw new Error(r.error);
+      SH.plan = null;
+      toast('Access rules applied and Sparks tagged', 'ok');
+      await refreshShare();
+    });
+    if (act === 'invite') return busy('invite', async () => {
+      const email = $('#sh-email').value.trim().toLowerCase();
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new Error('Enter the email address they use (or will use) to sign in to Tailscale');
+      const sparks = sshMachines().filter((m) => m.tsHost);
+      if (!sparks.length) throw new Error('Put the Sparks on your tailnet first (step 2)');
+      if (!(await applyPlan({ addGuest: email }, { confirmText: `Give ${email} SSH access to the Sparks? This updates your tailnet:` }))) return;
+      const inv = await api.tsInvite(email);
+      if (!inv.ok) throw new Error(inv.error);
+      const code = await api.tsEncodeInvite({
+        tailnet: SH.ts.local.tailnet,
+        machines: sparks.map((m) => ({ name: m.name, host: m.tsHost, user: m.user, icon: machineIconKey(m) === 'nvidia' ? 'nvidia' : '' })),
+      });
+      const users = sparks.map((m) => `${m.name}: ${m.user}`).join(', ');
+      SH.result = {
+        email, code,
+        message: `You're invited to use my DGX Sparks through Nexus.\n\n`
+          + `1. Install Tailscale (https://tailscale.com/download) and join my tailnet with this link, signing in as ${email}:\n   ${inv.inviteUrl}\n\n`
+          + `2. Install Nexus: https://github.com/mirrorsedgepro-stack/Spark-Orchestrator/releases\n\n`
+          + `3. In Nexus click the Share (people) icon, paste this invite code under "Got an invite code?", and click Add Sparks:\n   ${code}\n\n`
+          + `You'll log in as ${users}. Please don't change other people's sessions or settings.`,
+      };
+      await refreshShare();
+    });
+    if (act === 'copymsg') { api.writeClipboard(SH.result.message); return toast('Invitation copied', 'ok'); }
+    if (act === 'copycode') { api.writeClipboard(SH.result.code); return toast('Invite code copied', 'ok'); }
+    if (act === 'remove') return busy('remove', async () => {
+      const email = b.dataset.email;
+      const g = ((SH.overview && SH.overview.guests) || []).find((x) => x.email === email) || {};
+      if (!confirm(`Remove ${email}?\n\nThey lose SSH access to the Sparks immediately${g.userId ? ' and are removed from your tailnet (their devices too)' : ''}.`)) return;
+      if (!(await applyPlan({ removeGuest: email }))) return;
+      const r = await api.tsRevoke({ userId: g.userId, inviteId: g.inviteId });
+      if (!r.ok) throw new Error(r.error);
+      toast(`${email} removed`, 'ok');
+      await refreshShare();
+    });
+    if (act === 'joincode') return busy('join', async () => {
+      const r = await api.tsDecodeInvite($('#sh-code').value);
+      if (!r.ok) throw new Error(r.error);
+      let added = 0;
+      for (const x of r.machines) {
+        if (S.cfg.machines.some((m) => m.host === x.host || m.tsHost === x.host)) continue;
+        S.cfg.machines.push({ id: `ts-${Date.now().toString(36)}${added}`, name: x.name, type: 'ssh', os: 'linux', host: x.host, tsHost: x.host, port: 22, user: x.user, keyPath: '', color: '#76B900', icon: x.icon || '' });
+        added++;
+      }
+      S.cfg = await api.saveConfig(S.cfg);
+      renderAll();
+      for (const m of S.cfg.machines) if (m.type === 'ssh' && m.tsHost && (S.mstate[m.id] || {}).status !== 'online') connectMachine(m.id);
+      toast(added ? `Added ${added} Spark${added > 1 ? 's' : ''}. Connecting over Tailscale…` : 'Those Sparks are already in Nexus', 'ok');
+      closeShare();
+    });
+  }
+
   // ---------------------------------------------------------------- toasts
   function toast(msg, kind = '', ms = 3800, action = null) {
     const el = document.createElement('div');
@@ -1634,6 +1875,7 @@
   $('#layout-switch').addEventListener('click', (e) => { const b = e.target.closest('[data-layout]'); if (b) setLayout(Number(b.dataset.layout)); });
   $('#btn-palette').addEventListener('click', () => openPalette());
   $('#btn-workspaces').addEventListener('click', openWorkspaces);
+  $('#btn-share').addEventListener('click', openShare);
 
   api.onFocus((f) => {
     S.winFocused = f;

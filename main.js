@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, clipboard, shell, Notification, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, clipboard, shell, Notification, Menu, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -6,6 +6,7 @@ const { StringDecoder } = require('string_decoder');
 const config = require('./lib/config');
 const local = require('./lib/local');
 const { Machine } = require('./lib/remote');
+const tailscale = require('./lib/tailscale');
 
 if (!app.requestSingleInstanceLock()) app.quit();
 app.setAppUserModelId('com.nexus.terminal');
@@ -62,7 +63,7 @@ function getMachine(id) {
       remember: (k, fp) => { const c = config.load(); c.knownHosts[k] = fp; config.save(c); },
       askPassphrase,
     });
-    m.on('status', (status, error) => send('machine:status', id, status, error));
+    m.on('status', (status, error, route) => send('machine:status', id, status, error, route));
     machines.set(id, m);
   }
   return machines.get(id);
@@ -132,7 +133,9 @@ app.on('window-all-closed', () => {
 });
 
 // ---- IPC: config / app ----
-ipcMain.handle('config:get', () => config.load());
+// The renderer never sees the (encrypted) Tailscale token.
+const publicConfig = () => { const c = { ...config.load() }; if (c.tailscale) c.tailscale = { ...c.tailscale, token: undefined }; return c; };
+ipcMain.handle('config:get', () => publicConfig());
 // A fresh renderer (first load or reload) owns no sessions: drop any left over. Remote tmux sessions survive.
 ipcMain.on('app:hello', () => {
   for (const s of sessions.values()) { try { s.close(); } catch {} }
@@ -140,7 +143,7 @@ ipcMain.on('app:hello', () => {
 });
 ipcMain.handle('config:save', (_e, cfg) => {
   const prev = config.load();
-  config.save({ ...cfg, knownHosts: prev.knownHosts, window: prev.window });
+  config.save({ ...cfg, knownHosts: prev.knownHosts, window: prev.window, tailscale: prev.tailscale });
   // Drop connections whose address changed so the next use reconnects with new settings.
   for (const [id, m] of machines) {
     const a = prev.machines.find((x) => x.id === id), b = cfg.machines.find((x) => x.id === id);
@@ -150,11 +153,12 @@ ipcMain.handle('config:save', (_e, cfg) => {
       send('machine:status', id, 'offline', null);
     }
   }
-  return config.load();
+  return publicConfig();
 });
 // Merge top-level keys (workspaces, lastSession, recentDirs…) without touching the rest.
 ipcMain.handle('config:patch', (_e, patch) => {
   const c = config.load();
+  delete patch.tailscale;
   Object.assign(c, patch);
   config.save(c);
   return true;
@@ -214,6 +218,103 @@ ipcMain.handle('local:dirs', safe(async () => {
   const tilde = (p) => '~' + p.slice(home.length);
   return { repos: repos.filter((p) => p !== home).map(tilde), dirs: dirs.map(tilde) };
 }));
+
+// ---- IPC: Tailscale (sharing the Sparks with guests) ----
+// The API token is encrypted with the OS (DPAPI via safeStorage) and never leaves the main process.
+function tsToken() {
+  const enc = (config.load().tailscale || {}).token;
+  if (!enc || !safeStorage.isEncryptionAvailable()) return null;
+  try { return safeStorage.decryptString(Buffer.from(enc, 'base64')); } catch { return null; }
+}
+function tsApi() {
+  const t = tsToken();
+  if (!t) throw new Error('Add a Tailscale API access token first');
+  return new tailscale.TailscaleApi(t);
+}
+// Match configured SSH machines to tailnet devices by hostname (as reported by the probe).
+function matchDevices(devices, machines) {
+  return machines.map((m) => {
+    const d = devices.find((x) => (x.hostname || '').toLowerCase() === String(m.hostname || '').toLowerCase());
+    return {
+      machineId: m.machineId,
+      hostname: m.hostname,
+      device: d ? { id: d.id || d.nodeId, name: d.name, addresses: d.addresses || [], tags: d.tags || [], online: !!d.connectedToControl, lastSeen: d.lastSeen } : null,
+    };
+  });
+}
+
+ipcMain.handle('ts:status', async () => ({
+  local: await tailscale.localStatus(),
+  hasToken: !!tsToken(),
+  canEncrypt: safeStorage.isEncryptionAvailable(),
+}));
+ipcMain.handle('ts:set-token', safe(async (_e, token) => {
+  const t = String(token || '').trim();
+  if (!/^tskey-api-/.test(t)) throw new Error('That does not look like an API access token (it starts with tskey-api-)');
+  const devices = await new tailscale.TailscaleApi(t).devices(); // validates the token
+  if (!safeStorage.isEncryptionAvailable()) throw new Error('Windows secure storage is unavailable; the token was not saved');
+  const c = config.load();
+  c.tailscale = { ...(c.tailscale || {}), token: safeStorage.encryptString(t).toString('base64') };
+  config.save(c);
+  return { devices: devices.length };
+}));
+ipcMain.handle('ts:clear-token', () => {
+  const c = config.load();
+  if (c.tailscale) delete c.tailscale.token;
+  config.save(c);
+  return true;
+});
+
+// Everything the sharing panel shows: Spark devices, guests (policy group), their join state, pending invites.
+ipcMain.handle('ts:overview', safe(async (_e, machines) => {
+  const api = tsApi();
+  const [devices, users, invites, { policy }] = await Promise.all([api.devices(), api.users(), api.invites(), api.getPolicy()]);
+  const guests = tailscale.guestsIn(policy).map((email) => {
+    const u = users.find((x) => (x.loginName || '').toLowerCase() === email);
+    const inv = invites.find((x) => (x.email || '').toLowerCase() === email);
+    return { email, userId: u ? u.id : null, status: u ? (u.status || 'active') : inv ? 'invited' : 'not joined', inviteId: inv ? inv.id : null, inviteUrl: inv ? inv.inviteUrl : null, lastSeen: u ? u.lastSeen : null };
+  });
+  return { sparks: matchDevices(devices, machines), guests, tag: tailscale.SPARK_TAG };
+}));
+
+// Preview the policy + tag changes needed to share the Sparks (no changes made).
+ipcMain.handle('ts:plan', safe(async (_e, { machines, sshUsers, addGuest, removeGuest }) => {
+  const api = tsApi();
+  const [{ policy, etag }, devices] = await Promise.all([api.getPolicy(), api.devices()]);
+  let guests = tailscale.guestsIn(policy);
+  if (addGuest) guests = [...guests, addGuest.toLowerCase()];
+  if (removeGuest) guests = guests.filter((g) => g !== removeGuest.toLowerCase());
+  const plan = tailscale.planPolicy(policy, { guests, sshUsers });
+  const sparks = matchDevices(devices, machines);
+  const tagChanges = sparks.filter((s) => s.device && !s.device.tags.includes(tailscale.SPARK_TAG))
+    .map((s) => ({ deviceId: s.device.id, hostname: s.hostname, tags: [...s.device.tags, tailscale.SPARK_TAG] }));
+  const changes = [...plan.changes, ...tagChanges.map((t) => `Tag ${t.hostname} as ${tailscale.SPARK_TAG}`)];
+  const missing = sparks.filter((s) => !s.device).map((s) => s.hostname);
+  return { policy: plan.policy, etag, changes, tagChanges, missing };
+}));
+
+// Apply a previewed plan: validate the policy with Tailscale, save it (only if unchanged since the preview), tag devices.
+ipcMain.handle('ts:apply', safe(async (_e, { policy, etag, tagChanges }) => {
+  const api = tsApi();
+  const v = await api.validatePolicy(policy);
+  if (v && v.message) throw new Error(`Tailscale rejected the policy: ${v.message}${v.data ? ' ' + JSON.stringify(v.data) : ''}`);
+  await api.setPolicy(policy, etag);
+  for (const t of tagChanges || []) await api.setTags(t.deviceId, t.tags);
+  return {};
+}));
+
+ipcMain.handle('ts:invite', safe(async (_e, email) => {
+  const inv = await tsApi().createInvite(email);
+  return { inviteUrl: inv && inv.inviteUrl, inviteId: inv && inv.id };
+}));
+ipcMain.handle('ts:revoke', safe(async (_e, { userId, inviteId }) => {
+  const api = tsApi();
+  if (inviteId) await api.deleteInvite(inviteId);
+  if (userId) await api.deleteUser(userId);
+  return {};
+}));
+ipcMain.handle('ts:encode-invite', (_e, data) => tailscale.encodeInvite(data));
+ipcMain.handle('ts:decode-invite', safe(async (_e, code) => tailscale.decodeInvite(code)));
 
 // ---- IPC: sessions ----
 ipcMain.handle('session:create', async (_e, spec) => {

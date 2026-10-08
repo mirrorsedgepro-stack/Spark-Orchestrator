@@ -42,6 +42,17 @@ contextBridge.exposeInMainWorld('nexus', {
   pasteImage: (id) => ipcRenderer.invoke('session:paste-image', id),
   uploadFiles: (id, paths) => ipcRenderer.invoke('session:upload-files', id, paths),
 
+  tsStatus: () => ipcRenderer.invoke('ts:status'),
+  tsSetToken: (t) => ipcRenderer.invoke('ts:set-token', t),
+  tsClearToken: () => ipcRenderer.invoke('ts:clear-token'),
+  tsOverview: (machines) => ipcRenderer.invoke('ts:overview', machines),
+  tsPlan: (args) => ipcRenderer.invoke('ts:plan', args),
+  tsApply: (plan) => ipcRenderer.invoke('ts:apply', plan),
+  tsInvite: (email) => ipcRenderer.invoke('ts:invite', email),
+  tsRevoke: (args) => ipcRenderer.invoke('ts:revoke', args),
+  tsEncodeInvite: (data) => ipcRenderer.invoke('ts:encode-invite', data),
+  tsDecodeInvite: (code) => ipcRenderer.invoke('ts:decode-invite', code),
+
   onData: on('session:data'),
   onExit: on('session:exit'),
   onMachineStatus: on('machine:status'),
