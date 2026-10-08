@@ -75,6 +75,27 @@ jobs:
           clamscan --version
           for d in variants/*/; do
             n=$(basename "$d")
-            hits=$(clamscan -r --infected --no-summary --max-filesize=500M --max-scansize=2000M "$d" "unpacked/$n" 2>/dev/null)
+            hits=$(clamscan -r --infected --no-summary --max-filesize=500M --max-scansize=2000M "$d" "unpacked/$n" 2>/dev/null || true)
             if [ -z "$hits" ]; then echo "CLEAN   $n"; else echo "FLAGGED $n"; echo "$hits" | sed 's/^/        /'; fi
           done
+          echo "== hashes of each variant's Nexus.exe (official electron.exe 44.5.1 = 49b61a030a520fc36a4b8fa5cce53fb4e935a7bdbbe4b80e9222f598e49cc7fa)"
+          find unpacked -name Nexus.exe -exec sha256sum {} \;
+
+  defender:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: variants
+          path: variants
+      - name: Microsoft Defender per variant
+        shell: pwsh
+        run: |
+          $mp = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+          & $mp -SignatureUpdate | Select-Object -Last 1
+          "Defender signatures: " + (Get-MpComputerStatus).AntivirusSignatureVersion
+          foreach ($f in Get-ChildItem variants -Recurse -Include *.exe, *.zip) {
+            $r = & $mp -Scan -ScanType 3 -File $f.FullName -DisableRemediation | Select-Object -Last 1
+            "{0}: {1}" -f $f.Directory.Name, $r
+          }
